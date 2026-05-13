@@ -33,14 +33,18 @@ defmodule MobiusProcessing.MixProject do
       extras: [
         "README.md",
         "SPEC.md": [title: "Design spec"],
-        "guides/recipes/overview.md": [title: "Recipes — overview"],
-        "guides/recipes/core_nx.md": [title: "Core Nx"],
-        "guides/recipes/scholar.md": [title: "Scholar"],
-        "guides/recipes/nx_signal.md": [title: "NxSignal"],
-        "guides/recipes/defn_kernels.md": [title: "Hand-written defn kernels"]
+        "guides/recipes/overview.md": [title: "Recipes — overview"]
       ],
       groups_for_extras: [
         Recipes: ~r"guides/recipes/.*"
+      ],
+      groups_for_modules: [
+        Recipes: [
+          MobiusProcessing.Recipes.CoreNx,
+          MobiusProcessing.Recipes.Scholar,
+          MobiusProcessing.Recipes.NxSignal,
+          MobiusProcessing.Recipes.DefnKernels
+        ]
       ]
     ]
   end
