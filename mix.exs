@@ -9,7 +9,9 @@ defmodule MobiusProcessing.MixProject do
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       name: "Mobius processing",
-      description: "TODO: write a proper description",
+      description:
+        "Bridge between Mobius metric storage and the Nx ecosystem: " <>
+          "pulls Mobius data out as Arrow columns and hands it to Nx as tensors.",
       docs: docs(),
       package: package(),
       aliases: aliases(),
@@ -27,7 +29,19 @@ defmodule MobiusProcessing.MixProject do
   def docs do
     [
       main: "readme",
-      extras: ["README.md"]
+      extra_section: "GUIDES",
+      extras: [
+        "README.md",
+        "SPEC.md": [title: "Design spec"],
+        "guides/recipes/overview.md": [title: "Recipes — overview"],
+        "guides/recipes/core_nx.md": [title: "Core Nx"],
+        "guides/recipes/scholar.md": [title: "Scholar"],
+        "guides/recipes/nx_signal.md": [title: "NxSignal"],
+        "guides/recipes/defn_kernels.md": [title: "Hand-written defn kernels"]
+      ],
+      groups_for_extras: [
+        Recipes: ~r"guides/recipes/.*"
+      ]
     ]
   end
 
@@ -79,14 +93,18 @@ defmodule MobiusProcessing.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
+      {:nx, "~> 0.7"},
+      {:arrow, path: "../arrow"},
+      {:mobius, "~> 0.6"},
+      {:jason, "~> 1.4"},
+      {:scholar, "~> 0.3", optional: true},
+      {:nx_signal, "~> 0.2", optional: true},
       {:nstandard, "~> 0.3"},
       {:igniter, "~> 0.6", only: [:dev, :test]},
       {:ex_doc, "~> 0.40", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:spellweaver, "~> 0.1", only: [:dev, :test], runtime: false}
-      # {:dep_from_hexpm, "~> 0.3.0"},
-      # {:dep_from_git, git: "https://github.com/elixir-lang/my_dep.git", tag: "0.1.0"}
     ]
   end
 end
