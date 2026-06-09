@@ -158,7 +158,8 @@ defmodule MobiusSmarts.Sweeper do
   end
 
   defp active_for(board, metric) do
-    Enum.filter(Board.findings(board), &(&1.metric == metric.name))
+    key = Config.Metric.key(metric)
+    Enum.filter(Board.findings(board), &({&1.metric, &1.tags} == key))
   end
 
   defp pull(%{config: config}, metric, window) do
