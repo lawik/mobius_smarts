@@ -54,6 +54,58 @@ defmodule MobiusSmarts.Detect.DriftTest do
     end
   end
 
+  describe "the :baseline option" do
+    # The map shape returned by Jump.baseline/3, carrying both noise
+    # scales — the detector must pick sigma_avg, never sigma_reports.
+    @baseline %{target: 10.0, sigma_reports: 5.0, sigma_avg: 1.0}
+
+    test "scan reads target and sigma_avg from the baseline map" do
+      values = List.duplicate(10.0, 10) ++ List.duplicate(12.0, 10)
+
+      explicit = Drift.scan(values, target: 10.0, sigma: 1.0)
+      from_baseline = Drift.scan(values, baseline: @baseline)
+
+      assert from_baseline.upper_alarm == explicit.upper_alarm
+      assert from_baseline.upper_onset == explicit.upper_onset
+      assert Nx.to_flat_list(from_baseline.upper) == Nx.to_flat_list(explicit.upper)
+      assert Nx.to_flat_list(from_baseline.lower) == Nx.to_flat_list(explicit.lower)
+    end
+
+    test "new reads target and sigma_avg from the baseline map" do
+      assert Drift.new(baseline: @baseline) == Drift.new(target: 10.0, sigma: 1.0)
+    end
+
+    test "explicit :target and :sigma win over the baseline" do
+      values = List.duplicate(10.0, 10) ++ List.duplicate(12.0, 10)
+      deaf = %{target: 0.0, sigma_reports: 1.0, sigma_avg: 100.0}
+
+      overridden = Drift.scan(values, baseline: deaf, target: 10.0, sigma: 1.0)
+      explicit = Drift.scan(values, target: 10.0, sigma: 1.0)
+
+      assert overridden.upper_alarm == explicit.upper_alarm
+      assert Nx.to_flat_list(overridden.upper) == Nx.to_flat_list(explicit.upper)
+
+      assert Drift.new(baseline: deaf, target: 10.0, sigma: 1.0) ==
+               Drift.new(target: 10.0, sigma: 1.0)
+    end
+
+    test "neither a baseline nor both explicit values raises pointedly" do
+      assert_raise ArgumentError, ~r/sigma_avg/, fn -> Drift.scan([1.0, 2.0], []) end
+      assert_raise ArgumentError, ~r/sigma_avg/, fn -> Drift.scan([1.0, 2.0], target: 10.0) end
+      assert_raise ArgumentError, ~r/sigma_avg/, fn -> Drift.new(sigma: 1.0) end
+    end
+
+    test "a baseline without :sigma_avg raises instead of guessing a scale" do
+      assert_raise ArgumentError, ~r/sigma_avg/, fn ->
+        Drift.scan([1.0, 2.0], baseline: %{target: 10.0, sigma_reports: 5.0})
+      end
+
+      assert_raise ArgumentError, ~r/sigma_avg/, fn ->
+        Drift.new(baseline: %{target: 10.0, sigma_reports: 5.0})
+      end
+    end
+  end
+
   describe "detection behavior" do
     test "in-control series does not alarm" do
       values = Enum.map(seeded_noise(300, 99), &(50.0 + 3.0 * &1))

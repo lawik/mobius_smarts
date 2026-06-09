@@ -42,17 +42,21 @@ defmodule MobiusSmarts.Detect do
 
       baseline = Detect.Jump.baseline(avgs, stds, counts)
 
-      # Drift/Shift watch the *average* series: they take sigma_avg.
-      Detect.Drift.scan(avgs, target: baseline.target, sigma: baseline.sigma_avg)
+      # Every detector takes the baseline map directly and picks the
+      # field at its own scale: Drift/Shift watch the *average* series
+      # and read target/sigma_avg; Jump scales its own limits by
+      # sqrt(n) and reads target/sigma_reports.
+      Detect.Drift.scan(avgs, baseline: baseline)
       #=> %{upper_alarm: 161, upper_onset: 142, ...}
-
-      # Jump scales its own limits by sqrt(n): it takes the baseline map
-      # (or its {target, sigma_reports} pair) directly.
+      Detect.Shift.chart(avgs, baseline: baseline)
       Detect.Jump.scan(avgs, stds, counts, baseline: baseline)
 
   The two sigma scales differ by `sqrt(reports_per_window)` — wiring
   `sigma_reports` into Drift/Shift makes them nearly deaf, which is why
-  `Detect.Jump.baseline/3` returns both, explicitly named.
+  `Detect.Jump.baseline/3` returns both, explicitly named, and why
+  passing the whole map is the recommended form. Explicit `:target` and
+  `:sigma` options remain for hand-set values and override the
+  baseline's fields when both are given.
 
   ## Calibration assumes independent windows
 

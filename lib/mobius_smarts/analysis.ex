@@ -264,8 +264,7 @@ defmodule MobiusSmarts.Analysis do
   defp shift_candidates(lists, baseline, calib, config) do
     result =
       Shift.chart(lists.avg,
-        target: baseline.target,
-        sigma: baseline.sigma_avg,
+        baseline: baseline,
         lambda: config.ewma_lambda,
         l: calib.ewma_l
       )
@@ -305,8 +304,7 @@ defmodule MobiusSmarts.Analysis do
   defp drift_candidates(lists, baseline, calib, config) do
     result =
       Drift.scan(lists.avg,
-        target: baseline.target,
-        sigma: baseline.sigma_avg,
+        baseline: baseline,
         k: config.cusum_k,
         h: calib.cusum_h
       )

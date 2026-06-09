@@ -64,15 +64,23 @@ defmodule MobiusSmarts.Detect.Shift do
 
   Options:
 
-  - `:target` (required) — in-control mean from a healthy baseline.
-  - `:sigma` (required) — in-control standard deviation **of the window
-    averages** (`sigma_avg` from
-    `MobiusSmarts.Detect.Jump.baseline/3`, not the per-report
-    `sigma_reports` — the two differ by `sqrt(reports_per_window)` and
-    the wrong one makes the band uselessly wide).
+  - `:baseline` — a map with `:target` and `:sigma_avg`, as returned by
+    `MobiusSmarts.Detect.Jump.baseline/3`; the chart reads those two
+    fields and ignores the rest (notably `:sigma_reports`, which is the
+    wrong scale here).
+  - `:target` — in-control mean from a healthy baseline. Overrides the
+    baseline's `target`; required when no `:baseline` is given.
+  - `:sigma` — in-control standard deviation **of the window averages**
+    (the baseline's `sigma_avg`, not the per-report `sigma_reports` —
+    the two differ by `sqrt(reports_per_window)` and the wrong one
+    makes the band uselessly wide). Overrides the baseline's
+    `sigma_avg`; required when no `:baseline` is given.
   - `:lambda` — nudge weight in `(0, 1]`, default `0.2`. Smaller
     detects smaller shifts but reacts more slowly.
   - `:l` — band width in (asymptotic) sigma units, default `3.0`.
+
+  Either `:baseline` or both `:target` and `:sigma` must be supplied;
+  anything less raises an `ArgumentError`.
 
   Returns the smoothed series, both limit series, a u8 violation mask,
   and the first violating index (`nil` if none).
@@ -90,6 +98,16 @@ defmodule MobiusSmarts.Detect.Shift do
       iex> result = Shift.chart(shifted, target: 50.0, sigma: 2.0)
       iex> is_integer(result.first_violation) and result.first_violation >= 15
       true
+
+  The baseline map from `MobiusSmarts.Detect.Jump.baseline/3` plugs
+  in directly — `target` and `sigma_avg` are picked for you:
+
+      iex> alias MobiusSmarts.Detect.Shift
+      iex> baseline = %{target: 50.0, sigma_reports: 10.0, sigma_avg: 2.0}
+      iex> shifted = List.duplicate(50.0, 15) ++ List.duplicate(53.0, 15)
+      iex> result = Shift.chart(shifted, baseline: baseline)
+      iex> is_integer(result.first_violation) and result.first_violation >= 15
+      true
   """
   @spec chart(Nx.Tensor.t() | [number()], keyword()) :: chart_result()
   def chart(values, opts)
@@ -101,8 +119,9 @@ defmodule MobiusSmarts.Detect.Shift do
   end
 
   def chart(values, opts) do
-    target = Keyword.fetch!(opts, :target) * 1.0
-    sigma = Keyword.fetch!(opts, :sigma) * 1.0
+    {target, sigma} = resolve_target_sigma!(opts)
+    target = target * 1.0
+    sigma = sigma * 1.0
     lambda = Keyword.get(opts, :lambda, 0.2) * 1.0
     l = Keyword.get(opts, :l, 3.0) * 1.0
 
@@ -136,14 +155,23 @@ defmodule MobiusSmarts.Detect.Shift do
   @doc """
   Initialize streaming state. Same options as `chart/2`. The impression
   starts at `target`.
+
+  ## Examples
+
+      iex> alias MobiusSmarts.Detect.Shift
+      iex> baseline = %{target: 50.0, sigma_reports: 10.0, sigma_avg: 2.0}
+      iex> state = Shift.new(baseline: baseline)
+      iex> {state.target, state.sigma}
+      {50.0, 2.0}
   """
   @spec new(keyword()) :: state()
   def new(opts) do
-    target = Keyword.fetch!(opts, :target) * 1.0
+    {target, sigma} = resolve_target_sigma!(opts)
+    target = target * 1.0
 
     %{
       target: target,
-      sigma: Keyword.fetch!(opts, :sigma) * 1.0,
+      sigma: sigma * 1.0,
       lambda: Keyword.get(opts, :lambda, 0.2) * 1.0,
       l: Keyword.get(opts, :l, 3.0) * 1.0,
       smoothed: target,
@@ -196,6 +224,35 @@ defmodule MobiusSmarts.Detect.Shift do
     ucl = target + half_width
     lcl = target - half_width
     {ucl, lcl, smoothed > ucl or smoothed < lcl}
+  end
+
+  # Explicit :target/:sigma win over the :baseline map, field by field;
+  # without a baseline both are required.
+  defp resolve_target_sigma!(opts) do
+    case Keyword.get(opts, :baseline) do
+      %{target: target, sigma_avg: sigma_avg} ->
+        {Keyword.get(opts, :target, target), Keyword.get(opts, :sigma, sigma_avg)}
+
+      nil ->
+        with {:ok, target} <- Keyword.fetch(opts, :target),
+             {:ok, sigma} <- Keyword.fetch(opts, :sigma) do
+          {target, sigma}
+        else
+          :error ->
+            raise ArgumentError,
+                  "no in-control level/noise scale: pass baseline: (the map from " <>
+                    "MobiusSmarts.Detect.Jump.baseline/3 — its :target and :sigma_avg " <>
+                    "are read) or both :target and :sigma explicitly. If setting :sigma " <>
+                    "by hand, use the baseline's sigma_avg — sigma_reports is a " <>
+                    "different scale (off by sqrt(reports_per_window)) and makes the " <>
+                    "band uselessly wide."
+        end
+
+      other ->
+        raise ArgumentError,
+              ":baseline must be a map with :target and :sigma_avg, as returned by " <>
+                "MobiusSmarts.Detect.Jump.baseline/3; got: #{inspect(other)}"
+    end
   end
 
   defp to_list(values) when is_list(values), do: Enum.map(values, &(&1 * 1.0))
