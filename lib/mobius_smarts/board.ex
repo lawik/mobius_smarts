@@ -58,37 +58,28 @@ defmodule MobiusSmarts.Board do
   def novelty(board), do: lookup(board, :novelty)
 
   @spec status(atom()) :: map()
-  def status(board) do
-    lookup(board, :status) ||
-      %{level: :ok, since: nil, concern: 0.0, findings: [], learning: []}
-  end
+  def status(board), do: lookup(board, :status)
 
   @spec findings(atom()) :: [Finding.t()]
   def findings(board) do
-    :ets.foldl(
-      fn
-        {{:finding, _id}, %Finding{class: :condition, status: :active} = f, _miss}, acc ->
-          [f | acc]
+    board
+    |> fold_findings(fn
+      {{:finding, _id}, %Finding{class: :condition, status: :active} = f, _miss}, acc ->
+        [f | acc]
 
-        _row, acc ->
-          acc
-      end,
-      [],
-      board
-    )
+      _row, acc ->
+        acc
+    end)
     |> Enum.sort_by(&{severity_rank(&1.severity), -&1.concern})
   end
 
   @spec observations(atom(), pos_integer()) :: [Finding.t()]
   def observations(board, limit \\ 50) do
-    :ets.foldl(
-      fn
-        {{:finding, _id}, %Finding{class: :observation} = f, _miss}, acc -> [f | acc]
-        _row, acc -> acc
-      end,
-      [],
-      board
-    )
+    board
+    |> fold_findings(fn
+      {{:finding, _id}, %Finding{class: :observation} = f, _miss}, acc -> [f | acc]
+      _row, acc -> acc
+    end)
     |> Enum.sort_by(&(-&1.raised_at))
     |> Enum.take(limit)
   end
@@ -284,6 +275,21 @@ defmodule MobiusSmarts.Board do
       [{^key, value}] -> value
       [] -> nil
     end
+  rescue
+    ArgumentError -> raise_not_running(board)
+  end
+
+  defp fold_findings(board, fun) do
+    :ets.foldl(fun, [], board)
+  rescue
+    ArgumentError -> raise_not_running(board)
+  end
+
+  @spec raise_not_running(atom()) :: no_return()
+  defp raise_not_running(board) do
+    raise ArgumentError,
+          "no MobiusSmarts instance named #{inspect(board)} — is it started? " <>
+            "(status/findings read the instance's ETS table)"
   end
 
   defp emit(state, event, %Finding{} = finding) do
