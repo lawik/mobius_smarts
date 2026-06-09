@@ -8,6 +8,11 @@ defmodule MobiusSmartsTest do
 
   alias MobiusSmarts.StubSource
 
+  # The stub's 60s window cadence intentionally mismatches the
+  # millisecond tick interval, which (correctly) logs a calibration
+  # warning per metric — keep it out of passing-test output.
+  @moduletag :capture_log
+
   doctest MobiusSmarts
 
   defp seeded(seed), do: :rand.seed(:exsss, {seed, seed * 7, seed * 13})

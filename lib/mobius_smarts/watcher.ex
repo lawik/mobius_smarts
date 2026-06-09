@@ -38,7 +38,8 @@ defmodule MobiusSmarts.Watcher do
     state = %{
       board: Keyword.fetch!(opts, :name),
       config: config,
-      calib: Calibrate.for_config(config)
+      calib: Calibrate.for_config(config),
+      cadence_warned: MapSet.new()
     }
 
     {:ok, state, {:continue, :tick}}
@@ -46,7 +47,12 @@ defmodule MobiusSmarts.Watcher do
 
   @impl GenServer
   def handle_continue(:tick, state) do
-    tick(state)
+    state = tick(state)
+
+    # Scheduled after the tick's work, so the effective cadence is
+    # interval + work time. Known and acceptable drift: every tick
+    # re-scans trailing history, so nothing is missed — confirmation
+    # just lands a moment later.
     Process.send_after(self(), :tick, Config.ms(state.config.interval))
     {:noreply, state}
   end
@@ -55,11 +61,11 @@ defmodule MobiusSmarts.Watcher do
   def handle_info(:tick, state), do: {:noreply, state, {:continue, :tick}}
 
   defp tick(state) do
-    latest =
-      for metric <- state.config.watch, into: %{} do
+    {latest, state} =
+      Enum.map_reduce(state.config.watch, state, fn metric, state ->
         key = Config.Metric.key(metric)
 
-        latest =
+        {latest, state} =
           try do
             watch_metric(state, metric, key)
           rescue
@@ -68,16 +74,19 @@ defmodule MobiusSmarts.Watcher do
                 "MobiusSmarts tick failed for #{metric.name}: #{Exception.message(error)}"
               )
 
-              nil
+              {nil, state}
           end
 
-        {key, latest}
-      end
+        {{key, latest}, state}
+      end)
 
-    score_novelty(state, latest)
+    score_novelty(state, Map.new(latest))
+    state
   end
 
-  # Returns the metric's latest {ts, avg} for the novelty vector.
+  # Returns {latest, state}: the metric's latest {ts, avg} for the
+  # novelty vector — nil when the metric is empty or stale — plus
+  # state with any cadence warning recorded.
   defp watch_metric(state, metric, key) do
     config = state.config
     now = System.system_time(:second)
@@ -91,7 +100,7 @@ defmodule MobiusSmarts.Watcher do
     case series do
       :empty ->
         Board.report(state.board, key, @tick_kinds, [Analysis.silent_candidate(nil, now)])
-        nil
+        {nil, state}
 
       series ->
         lists = Analysis.to_lists(series)
@@ -99,18 +108,53 @@ defmodule MobiusSmarts.Watcher do
         segment = Analysis.active_segment(lists, gaps)
         last_ts = List.last(segment.ts)
 
+        state = warn_cadence_mismatch(state, metric, key, cadence)
+
         stale_after = config.gap_factor * max(cadence || 0, Config.seconds(config.interval))
+        stale? = now - last_ts > stale_after
 
         candidates =
           Analysis.gap_candidates(gaps) ++
-            if now - last_ts > stale_after do
+            if stale? do
               [Analysis.silent_candidate(last_ts, now)]
             else
               detector_candidates(state, key, segment, now)
             end
 
         Board.report(state.board, key, @tick_kinds, candidates)
-        {last_ts, List.last(segment.avg)}
+
+        # A stale metric contributes nothing to the novelty vector: its
+        # hour-old "latest" paired with other metrics' live values would
+        # describe a cross-metric window that never happened.
+        if stale?, do: {nil, state}, else: {{last_ts, List.last(segment.avg)}, state}
+    end
+  end
+
+  # Calibration converts the false-alarm budget to windows through
+  # `:interval` (`Calibrate.for_config/1`), assuming the tick interval
+  # matches the Mobius RRD window cadence. When the series' own median
+  # cadence disagrees by more than 50%, every derived threshold is
+  # miscalibrated by roughly the ratio — worth one warning per metric,
+  # not one per tick.
+  defp warn_cadence_mismatch(state, metric, key, cadence) do
+    interval_s = Config.ms(state.config.interval) / 1000
+
+    mismatched? =
+      cadence != nil and cadence > 0 and interval_s > 0 and
+        abs(cadence - interval_s) > 0.5 * interval_s
+
+    if mismatched? and not MapSet.member?(state.cadence_warned, key) do
+      ratio = Float.round(max(cadence / interval_s, interval_s / cadence), 1)
+
+      Logger.warning(
+        "MobiusSmarts: #{metric.name} reports every ~#{cadence}s but :interval is " <>
+          "#{interval_s}s — the false-alarm budget is calibrated against :interval " <>
+          "and will be off by roughly #{ratio}x"
+      )
+
+      %{state | cadence_warned: MapSet.put(state.cadence_warned, key)}
+    else
+      state
     end
   end
 
@@ -137,7 +181,7 @@ defmodule MobiusSmarts.Watcher do
 
   defp score_novelty(state, latest) do
     with model when model != nil <- Board.novelty(state.board),
-         vector when vector != nil <- vector_for(model, latest) do
+         vector when vector != nil <- vector_for(model, latest, state.config) do
       candidates = Analysis.novelty_candidates(model, vector)
       Board.report(state.board, {"*", %{}}, [:novel_behavior], candidates)
     else
@@ -147,13 +191,25 @@ defmodule MobiusSmarts.Watcher do
 
   # The model's metrics in its fitted order — all must have reported
   # this tick, or the vector (and a correlation judgement on it) would
-  # be fabricated.
-  defp vector_for(model, latest) do
+  # be fabricated. And because the model was fitted on timestamp-ALIGNED
+  # rows only (`Analysis.fit_novelty/3` intersects timestamps), the
+  # scored vector must be aligned too: the per-metric latest timestamps
+  # may spread by at most one configured `:interval` — the declared RRD
+  # cadence (chosen over the measured cadence, which is per-metric and
+  # could disagree between metrics). Values further apart than that
+  # straddle windows the model never saw side by side.
+  defp vector_for(model, latest, config) do
     values = Enum.map(model.keys, &latest[&1])
 
-    case Enum.find(values, &is_nil/1) do
-      nil -> Enum.map(values, &elem(&1, 1))
-      _missing -> nil
+    if Enum.any?(values, &is_nil/1) or not aligned?(values, config) do
+      nil
+    else
+      Enum.map(values, &elem(&1, 1))
     end
+  end
+
+  defp aligned?(values, config) do
+    {min_ts, max_ts} = values |> Enum.map(&elem(&1, 0)) |> Enum.min_max()
+    max_ts - min_ts <= Config.seconds(config.interval)
   end
 end
