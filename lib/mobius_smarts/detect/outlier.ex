@@ -63,9 +63,15 @@ defmodule MobiusSmarts.Detect.Outlier do
   ## Model JSON format
 
   Array-of-columns per tree; node `0` is the root; `feature == -1`
-  marks a leaf; `size[i]` is how many training samples reached node
-  `i`. At an internal node go **left** when `x[feature] <= threshold`
-  (the sklearn convention).
+  marks a leaf; sklearn's `-2` (its `TREE_UNDEFINED`, which a verbatim
+  `tree_.feature` export carries at every leaf) is accepted and
+  normalized to `-1` at load time. Leaf `threshold` entries are never
+  read, so the `-2.0` sklearn writes there is harmless. `size[i]` is
+  how many training samples reached node `i`. At an internal node go
+  **left** when `x[feature] <= threshold` (the sklearn convention).
+  Children always carry higher indices than their parent (sklearn's
+  array layout); `load!/1` enforces this, which structurally rules out
+  cycles.
 
       {
         "psi": 256,
@@ -95,8 +101,8 @@ defmodule MobiusSmarts.Detect.Outlier do
       for e in est.estimators_:
           t = e.tree_
           trees.append({
-              "feature":   t.feature.tolist(),         # -1 at leaves
-              "threshold": t.threshold.tolist(),
+              "feature":   t.feature.tolist(),          # -2 at leaves (TREE_UNDEFINED)
+              "threshold": t.threshold.tolist(),        # -2.0 at leaves; never read
               "left":      t.children_left.tolist(),    # -1 at leaves
               "right":     t.children_right.tolist(),   # -1 at leaves
               "size":      t.n_node_samples.tolist(),
@@ -139,8 +145,13 @@ defmodule MobiusSmarts.Detect.Outlier do
   decoder) into the fast `t:model/0` form.
 
   Raises `ArgumentError` with a pointed message on anything malformed:
-  missing keys, ragged columns within a tree, a non-positive `psi`, or
-  a feature index that reaches past `n_features`.
+  missing keys, ragged columns within a tree, a non-positive `psi`, a
+  feature index that reaches past `n_features`, or a child index that
+  is out of range or fails to point forward — every internal node's
+  children must carry indices greater than the node's own (the order
+  sklearn emits), which guarantees the tree is acyclic and traversal
+  terminates. sklearn's `-2` leaf marker in `feature` is accepted and
+  normalized to `-1`.
 
   ## Examples
 
@@ -286,6 +297,11 @@ defmodule MobiusSmarts.Detect.Outlier do
         {key, column!(tree, key, index)}
       end)
 
+    # sklearn writes TREE_UNDEFINED = -2 in `feature` at leaves (only the
+    # children arrays use -1). Accept that and normalize to this module's
+    # -1 leaf marker so walk/4 stays single-convention.
+    cols = Map.update!(cols, "feature", &normalize_leaf_markers/1)
+
     n = length(cols["feature"])
 
     for {key, col} <- cols, length(col) != n do
@@ -307,6 +323,13 @@ defmodule MobiusSmarts.Detect.Outlier do
 
   defp load_tree!(other, index, _n_features) do
     raise ArgumentError, "tree #{index} must be a map of columns, got: #{inspect(other)}"
+  end
+
+  defp normalize_leaf_markers(features) do
+    Enum.map(features, fn
+      -2 -> -1
+      feature -> feature
+    end)
   end
 
   defp column!(tree, key, index) do
@@ -352,12 +375,20 @@ defmodule MobiusSmarts.Detect.Outlier do
       not is_integer(feature) or feature < 0 or feature >= n_features ->
         raise ArgumentError,
               "tree #{index}, node #{node}: feature index #{inspect(feature)} out of " <>
-                "range for n_features=#{n_features} (leaves use -1)"
+                "range for n_features=#{n_features} (leaves use -1; sklearn's -2 is " <>
+                "accepted and normalized)"
 
       child_out_of_range?(left, n) or child_out_of_range?(right, n) ->
         raise ArgumentError,
               "tree #{index}, node #{node}: child index out of range " <>
                 "(left=#{inspect(left)}, right=#{inspect(right)}, nodes=#{n})"
+
+      left <= node or right <= node ->
+        raise ArgumentError,
+              "tree #{index}, node #{node}: children must point forward " <>
+                "(left=#{inspect(left)}, right=#{inspect(right)} must both be > #{node}); " <>
+                "sklearn orders children after their parent, and a self- or " <>
+                "back-reference would make traversal loop forever"
 
       true ->
         :ok
