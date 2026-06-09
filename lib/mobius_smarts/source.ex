@@ -32,14 +32,15 @@ defmodule MobiusSmarts.Source do
   `:mobius_instance`) are forwarded to `Mobius.Data.metrics/4`.
 
   Returns `%{timestamps: s64 tensor, values: f64 tensor}`, or `:empty`
-  when the window holds no points.
+  when the window holds no points or the Mobius instance is unavailable.
   """
   @spec series(Mobius.metric_name(), Mobius.metric_type(), map(), keyword()) ::
           series() | :empty
   def series(metric_name, type, tags \\ %{}, opts \\ []) do
-    metric_name
-    |> Mobius.Data.metrics(type, tags, opts)
-    |> from_metrics()
+    case Mobius.Data.metrics(metric_name, type, tags, opts) do
+      {:ok, metrics} -> from_metrics(metrics)
+      {:error, :unavailable} -> :empty
+    end
   end
 
   @doc """
@@ -51,7 +52,8 @@ defmodule MobiusSmarts.Source do
 
   Returns `%{timestamps: s64, average: f64, std_dev: f64, reports: s64}`
   tensors, ascending in time, or `:empty` when the window holds no
-  points. `reports` is the per-window report count — the subgroup size
+  points or the Mobius instance is unavailable. `reports` is the
+  per-window report count — the subgroup size
   `MobiusSmarts.Detect.Jump` needs for its limits and baseline
   pooling. Windows with no reports contribute no point — gaps show as
   missing timestamps, which is itself a health signal worth checking
@@ -59,9 +61,10 @@ defmodule MobiusSmarts.Source do
   """
   @spec summary_series(Mobius.metric_name(), map(), keyword()) :: summary_series() | :empty
   def summary_series(metric_name, tags \\ %{}, opts \\ []) do
-    metric_name
-    |> Mobius.Data.summary_windows(tags, opts)
-    |> from_summary_windows()
+    case Mobius.Data.summary_windows(metric_name, tags, opts) do
+      {:ok, windows} -> from_summary_windows(windows)
+      {:error, :unavailable} -> :empty
+    end
   end
 
   @doc """
