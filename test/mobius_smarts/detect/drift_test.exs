@@ -111,4 +111,44 @@ defmodule MobiusSmarts.Detect.DriftTest do
       assert from_list.upper_alarm == from_tensor.upper_alarm
     end
   end
+
+  describe "alarm at exactly the threshold" do
+    # With target 0, sigma 1, k 0.5, values of 1.5 add exactly 1.0 to
+    # the bucket per window — after five windows the level is exactly
+    # h = 5.0. Page's CUSUM alarms when the statistic *reaches* h, and
+    # the Analysis layer raises a candidate at `bucket >= h`; the
+    # detector must agree or those candidates surface with a nil onset.
+    @exact_series List.duplicate(1.5, 5)
+
+    test "scan alarms when the bucket exactly equals h" do
+      result = Drift.scan(@exact_series, target: 0.0, sigma: 1.0, k: 0.5, h: 5.0)
+
+      assert Nx.to_number(result.upper[-1]) == 5.0
+      assert result.upper_alarm == 4
+      assert result.upper_onset == 0
+    end
+
+    test "streaming step agrees with scan at exact equality" do
+      {statuses, final} =
+        Enum.map_reduce(@exact_series, Drift.new(target: 0.0, sigma: 1.0), fn x, state ->
+          Drift.step(state, x)
+        end)
+
+      assert final.upper == 5.0
+      assert Enum.find_index(statuses, &(&1 == :upper_alarm)) == 4
+      assert final.upper_onset == 0
+    end
+
+    test "scan parity with the Analysis layer's >= candidate gate" do
+      # Analysis.drift_side/5 raises :drifting_* at `bucket >= h`;
+      # whenever it would, the detector must have registered the alarm,
+      # so the candidate's onset is dated rather than nil.
+      result = Drift.scan(@exact_series, target: 0.0, sigma: 1.0, k: 0.5, h: 5.0)
+      bucket = Nx.to_number(result.upper[-1])
+
+      assert bucket >= 5.0
+      assert result.upper_alarm != nil
+      assert result.upper_onset != nil
+    end
+  end
 end

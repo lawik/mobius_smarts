@@ -165,6 +165,24 @@ defmodule MobiusSmarts.AnalysisTest do
       assert_in_delta onset_index, drift_start, 15
     end
 
+    test "a drift landing exactly on the alarm line carries a dated onset" do
+      # calib's cusum_h is 6.0 and config's cusum_k is 0.5: windows at
+      # exactly target + 1.5 sigma add exactly 1.0 sigma-window to the
+      # CUSUM bucket each, so six of them land the bucket on h exactly.
+      # The candidate gate is `bucket >= h`; the detector must alarm at
+      # the same boundary or the candidate's onset comes back nil.
+      values = List.duplicate(50.0, 30) ++ List.duplicate(51.5, 6)
+      lists = windows(values, std: 1.0)
+
+      candidates =
+        Analysis.tick_candidates(lists, healthy_baseline(50.0, 1.0), calib(), config())
+
+      assert drifting = Enum.find(candidates, &(&1.kind == :drifting_up))
+      assert drifting.evidence.bucket == calib().cusum_h
+      # Onset dates from the last window before the drift began.
+      assert drifting.onset == Enum.at(lists.ts, 29)
+    end
+
     test "a jump in the last window is a :jumped condition; an old one is a :spiked observation" do
       seeded(24)
       values = Enum.map(1..100, fn _ -> 50.0 + noise(0.18) end)
