@@ -15,7 +15,10 @@ defmodule MobiusSmarts.Config do
   - `:mobius_instance` — which Mobius instance to read.
 
   Everything else has defaults stated in sigma units, windows, or
-  durations, with the tradeoff documented here:
+  durations. A duration is a `{count, unit}` tuple with a positive
+  integer count and a unit of `:second`, `:minute`, `:hour`, `:day`,
+  or `:week` — or a raw positive integer of milliseconds (handy for
+  fast test clocks). The tradeoffs:
 
   - `:interval` (default `{1, :minute}`) — tick cadence; should match
     the Mobius RRD resolution you want to monitor at.
@@ -43,7 +46,10 @@ defmodule MobiusSmarts.Config do
     series re-anchors after it and a `:reporting_gap` observation is
     recorded.
   - `:cusum_k` (default `0.5`) — Drift's drain rate: half the drift
-    size (in sigma) you care about.
+    size (in sigma) you care about. Must be in `(0, 3]`: above 3 the
+    threshold calibration's Siegmund inversion overflows `:math.exp`
+    (and a CUSUM tuned for 6-sigma drifts is a jump detector, not a
+    drift detector).
   - `:ewma_lambda` (default `0.2`) — Shift's nudge weight.
   - `:novelty` (default `:auto`) — cross-metric novelty detection:
     `:auto` enables it when at least 3 metrics are watched.
@@ -89,7 +95,12 @@ defmodule MobiusSmarts.Config do
     def key(%__MODULE__{name: name, tags: tags}), do: {name, tags}
   end
 
-  @type duration() :: {pos_integer(), :second | :minute | :hour | :day | :week}
+  @typedoc """
+  A time span: `{count, unit}` with a positive integer count, or raw
+  positive-integer milliseconds.
+  """
+  @type duration() ::
+          {pos_integer(), :second | :minute | :hour | :day | :week} | pos_integer()
 
   @type t() :: %__MODULE__{
           mobius_instance: atom(),
@@ -129,9 +140,27 @@ defmodule MobiusSmarts.Config do
             novelty: :auto,
             watch: []
 
+  @duration_keys [
+    :interval,
+    :sweep_interval,
+    :analysis_window,
+    :trend_window,
+    :false_alarm_budget,
+    :warn_horizon,
+    :critical_horizon,
+    :refit_interval
+  ]
+
+  @duration_units [:second, :minute, :hour, :day, :week]
+
   @doc """
-  Build a config from a keyword list, validating keys and normalizing
-  `:watch` entries into `MobiusSmarts.Config.Metric` structs.
+  Build a config from a keyword list, validating keys and value
+  ranges, and normalizing `:watch` entries into
+  `MobiusSmarts.Config.Metric` structs.
+
+  A bad value raises at build time, naming the key, the value
+  received, and the valid range — rather than detonating later inside
+  a detector at boot.
 
   ## Examples
 
@@ -142,6 +171,9 @@ defmodule MobiusSmarts.Config do
 
       iex> MobiusSmarts.Config.new!(watch: [], wat: 1)
       ** (ArgumentError) unknown MobiusSmarts config keys: [:wat]
+
+      iex> MobiusSmarts.Config.new!(ewma_lambda: 1.5)
+      ** (ArgumentError) invalid MobiusSmarts config: :ewma_lambda must be a number in (0, 1], got: 1.5
   """
   @spec new!(keyword()) :: t()
   def new!(opts) when is_list(opts) do
@@ -153,7 +185,14 @@ defmodule MobiusSmarts.Config do
     end
 
     config = struct!(__MODULE__, opts)
-    %{config | watch: Enum.map(config.watch, &normalize_metric/1)}
+
+    unless is_list(config.watch) do
+      invalid!(:watch, config.watch, "a list of watch entries")
+    end
+
+    config = %{config | watch: Enum.map(config.watch, &normalize_metric/1)}
+    validate!(config)
+    config
   end
 
   @doc """
@@ -164,7 +203,7 @@ defmodule MobiusSmarts.Config do
       iex> MobiusSmarts.Config.ms({2, :minute})
       120000
   """
-  @spec ms(duration() | non_neg_integer()) :: non_neg_integer()
+  @spec ms(duration()) :: pos_integer()
   def ms(int) when is_integer(int), do: int
   def ms({n, :second}), do: n * 1_000
   def ms({n, :minute}), do: n * 60_000
@@ -173,7 +212,7 @@ defmodule MobiusSmarts.Config do
   def ms({n, :week}), do: n * 7 * 86_400_000
 
   @doc "A duration as seconds."
-  @spec seconds(duration() | non_neg_integer()) :: non_neg_integer()
+  @spec seconds(duration()) :: non_neg_integer()
   def seconds(duration), do: div(ms(duration), 1_000)
 
   @doc "Whether cross-metric novelty detection is on for this config."
@@ -193,5 +232,133 @@ defmodule MobiusSmarts.Config do
     end
 
     struct!(Metric, Map.put(rest, :name, name))
+  end
+
+  defp validate!(%__MODULE__{} = c) do
+    Enum.each(@duration_keys, &validate_duration!(&1, Map.fetch!(c, &1)))
+    validate_budget!(c)
+
+    check!(:mobius_instance, c.mobius_instance, is_atom(c.mobius_instance), "an atom")
+    check!(:source, c.source, is_atom(c.source), "a module")
+
+    check!(
+      :min_baseline_windows,
+      c.min_baseline_windows,
+      is_integer(c.min_baseline_windows) and c.min_baseline_windows >= 2,
+      "an integer >= 2"
+    )
+
+    check!(
+      :clear_after,
+      c.clear_after,
+      is_integer(c.clear_after) and c.clear_after >= 1,
+      "an integer >= 1"
+    )
+
+    check!(
+      :gap_factor,
+      c.gap_factor,
+      is_number(c.gap_factor) and c.gap_factor > 1,
+      "a number > 1"
+    )
+
+    check!(
+      :cusum_k,
+      c.cusum_k,
+      is_number(c.cusum_k) and c.cusum_k > 0 and c.cusum_k <= 3,
+      "a number in (0, 3] (above 3 the Siegmund ARL inversion overflows :math.exp)"
+    )
+
+    check!(
+      :ewma_lambda,
+      c.ewma_lambda,
+      is_number(c.ewma_lambda) and c.ewma_lambda > 0 and c.ewma_lambda <= 1,
+      "a number in (0, 1]"
+    )
+
+    check!(
+      :novelty,
+      c.novelty,
+      c.novelty == :auto or is_boolean(c.novelty),
+      ":auto, true, or false"
+    )
+
+    Enum.each(c.watch, &validate_metric!/1)
+  end
+
+  defp validate_duration!(_key, {n, unit})
+       when is_integer(n) and n > 0 and unit in @duration_units do
+    :ok
+  end
+
+  defp validate_duration!(_key, milliseconds)
+       when is_integer(milliseconds) and milliseconds > 0 do
+    :ok
+  end
+
+  defp validate_duration!(key, value) do
+    invalid!(
+      key,
+      value,
+      "a duration ({count, :second | :minute | :hour | :day | :week} " <>
+        "with a positive integer count, or positive integer milliseconds)"
+    )
+  end
+
+  # A budget under one tick clamps every detector threshold to its
+  # floor (Calibrate's ARL bottoms out at 2), so the instance would
+  # alarm near-constantly while looking healthy on paper.
+  defp validate_budget!(%__MODULE__{false_alarm_budget: budget, interval: interval}) do
+    if ms(budget) < ms(interval) do
+      raise ArgumentError,
+            "invalid MobiusSmarts config: :false_alarm_budget (#{inspect(budget)}) must be " <>
+              "at least one :interval (#{inspect(interval)}); a sub-tick budget clamps every " <>
+              "detector threshold to its floor"
+    end
+  end
+
+  defp validate_metric!(%Metric{} = metric) do
+    unless is_binary(metric.name) do
+      raise ArgumentError,
+            "watch entry :metric name must be a string, got: #{inspect(metric.name)}"
+    end
+
+    check_metric!(metric, :tags, metric.tags, is_map(metric.tags), "a map")
+
+    check_metric!(
+      metric,
+      :histogram,
+      metric.histogram,
+      is_boolean(metric.histogram),
+      "a boolean"
+    )
+
+    for {key, value} <- [ceiling: metric.ceiling, floor: metric.floor] do
+      check_metric!(metric, key, value, is_nil(value) or is_number(value), "a number or nil")
+    end
+
+    if is_number(metric.floor) and is_number(metric.ceiling) and metric.floor >= metric.ceiling do
+      raise ArgumentError,
+            "watch entry #{inspect(metric.name)}: :floor (#{inspect(metric.floor)}) must be " <>
+              "below :ceiling (#{inspect(metric.ceiling)})"
+    end
+
+    :ok
+  end
+
+  defp check!(_key, _value, true, _expected), do: :ok
+  defp check!(key, value, false, expected), do: invalid!(key, value, expected)
+
+  defp check_metric!(_metric, _key, _value, true, _expected), do: :ok
+
+  defp check_metric!(metric, key, value, false, expected) do
+    raise ArgumentError,
+          "watch entry #{inspect(metric.name)}: #{inspect(key)} must be #{expected}, " <>
+            "got: #{inspect(value)}"
+  end
+
+  defp invalid!(key, value, expected) do
+    raise ArgumentError,
+          "invalid MobiusSmarts config: #{inspect(key)} must be #{expected}, got: #{inspect(value)}"
   end
 end
