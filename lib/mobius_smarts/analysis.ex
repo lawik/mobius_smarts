@@ -412,19 +412,23 @@ defmodule MobiusSmarts.Analysis do
       warn_s = Config.seconds(config.warn_horizon)
       critical_s = Config.seconds(config.critical_horizon)
 
+      # The O(n²) Theil-Sen fit is paid once; each threshold only
+      # projects the precomputed line.
+      fit = Trend.theil_sen(lists.avg, lists.ts)
+      slope = fit.slope
+      last_ts = List.last(lists.ts)
+
       for threshold <- [metric.ceiling, metric.floor],
           threshold != nil,
-          {:eta, eta_s} <- [Trend.eta_to_threshold(lists.avg, lists.ts, threshold)],
+          {:eta, eta_s} <- [Trend.eta_from_fit(fit, last_ts, threshold)],
           eta_s <= warn_s do
-        slope = Trend.theil_sen(lists.avg, lists.ts).slope
-
         %{
           kind: :approaching_limit,
           detector: :trend,
           class: :condition,
           severity: if(eta_s <= critical_s, do: :critical, else: :warning),
           concern: critical_s / max(eta_s, 1.0),
-          onset: List.last(lists.ts),
+          onset: last_ts,
           evidence: %{
             eta_s: eta_s,
             threshold: threshold,
