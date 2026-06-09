@@ -119,9 +119,9 @@ defmodule MobiusSmarts.MixProject do
     [
       {:nx, "~> 0.7"},
       {:telemetry, "~> 1.0"},
-      # On the histograms branch while the summary-window / histogram
-      # APIs live there; back to hex once released.
-      {:mobius, github: "mobius-home/mobius", branch: "histograms"},
+      # Tracking main for the summary-window / histogram APIs; back to
+      # hex once released.
+      {:mobius, github: "mobius-home/mobius", branch: "main"},
       {:nstandard, "~> 0.3"},
       {:stream_data, "~> 1.1", only: [:dev, :test]},
       {:igniter, "~> 0.6", only: [:dev, :test]},
