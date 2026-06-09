@@ -66,9 +66,10 @@ defmodule MobiusSmarts.Detect do
   cool morning will alarm every warm afternoon, forever). Before
   trusting the numbers: baseline over a window covering the full cycle
   (whole days, not hours), lengthen aggregation windows until lag-1
-  autocorrelation is small, consider differencing strongly seasonal
-  metrics or keeping hour-of-day baselines, and sanity-check the
-  false-alarm rate empirically on a known-healthy fortnight. Seasonal
+  autocorrelation is small (check with `lag1_autocorrelation/1`),
+  consider differencing strongly seasonal metrics or keeping
+  hour-of-day baselines, and sanity-check the false-alarm rate
+  empirically on a known-healthy fortnight. Seasonal
   baselines are a known gap, tracked in SPEC.md — for strongly cyclic
   metrics they are a prerequisite, not an enhancement.
 
@@ -81,4 +82,79 @@ defmodule MobiusSmarts.Detect do
   (CPU SIMD, no XLA toolchain), and `Nx.BinaryBackend` works everywhere
   at RRD scale.
   """
+
+  @doc """
+  Lag-1 sample autocorrelation of a window series — the calibration
+  check the caveat above asks for.
+
+  Every false-alarm rate this stack quotes assumes independent
+  in-control windows; autocorrelation between consecutive windows
+  silently inflates those rates, sometimes by an order of magnitude.
+  Run this on the same baseline series you feed the detectors. Rule of
+  thumb: if `|r1| ≳ 0.3`, lengthen the aggregation windows (longer
+  windows average away short-range correlation) or remove the
+  seasonality first — and don't trust the quoted ARLs until it drops.
+
+  `values` is a 1D tensor or list of window aggregates (the `average`
+  series from `MobiusSmarts.Source.summary_series/3` is the usual
+  input). Computes the standard biased ACF estimator
+
+      r1 = Σ_{t=1..n-1} (x_t − x̄)(x_{t+1} − x̄) / Σ_{t=1..n} (x_t − x̄)²
+
+  with `x̄` the full-series mean, so `r1` is always in `[-1, 1]`.
+  Near 0 means consecutive windows look independent; positive means
+  sluggish, trending windows (the dangerous case for false alarms);
+  negative means alternation.
+
+  Raises `ArgumentError` for series shorter than 3 windows and for
+  constant series (zero variance makes the estimator 0/0). Three
+  windows is the mathematical floor, not a useful sample — estimate
+  over the same dozens-of-windows stretch you baseline on.
+
+  ## Examples
+
+      iex> MobiusSmarts.Detect.lag1_autocorrelation([1.0, 2.0, 3.0, 4.0, 5.0])
+      0.4
+
+      iex> MobiusSmarts.Detect.lag1_autocorrelation(Nx.tensor([1, 2, 3, 4, 5]))
+      0.4
+
+      iex> [1.0, -1.0]
+      ...> |> Stream.cycle()
+      ...> |> Enum.take(10)
+      ...> |> MobiusSmarts.Detect.lag1_autocorrelation()
+      -0.9
+  """
+  @spec lag1_autocorrelation(Nx.Tensor.t() | [number()]) :: float()
+  def lag1_autocorrelation(values) do
+    n = series_length(values)
+
+    if n < 3 do
+      raise ArgumentError,
+            "got #{n} window(s) — too short to estimate autocorrelation; " <>
+              "run this over the same dozens-of-windows stretch you baseline on"
+    end
+
+    x = to_f64(values)
+    deviations = Nx.subtract(x, Nx.mean(x))
+    denominator = Nx.to_number(Nx.sum(Nx.multiply(deviations, deviations)))
+
+    if denominator == 0.0 do
+      raise ArgumentError,
+            "a constant series has no autocorrelation — every window equals " <>
+              "the mean, making the estimator 0/0; check that the metric is " <>
+              "actually varying before calibrating detectors on it"
+    end
+
+    numerator =
+      Nx.to_number(Nx.sum(Nx.multiply(deviations[0..-2//1], deviations[1..-1//1])))
+
+    numerator / denominator
+  end
+
+  defp series_length(values) when is_list(values), do: length(values)
+  defp series_length(values), do: Nx.size(values)
+
+  defp to_f64(values) when is_list(values), do: Nx.tensor(values, type: :f64)
+  defp to_f64(values), do: Nx.as_type(values, :f64)
 end
