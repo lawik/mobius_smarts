@@ -122,7 +122,7 @@ defmodule MobiusSmarts.MixProject do
       # Tracking main for the summary-window / histogram APIs; back to
       # hex once released.
       {:mobius, github: "mobius-home/mobius", branch: "main"},
-      {:nstandard, "~> 0.3"},
+      {:nstandard, "~> 0.3", only: [:dev, :test], runtime: false},
       {:stream_data, "~> 1.1", only: [:dev, :test]},
       {:igniter, "~> 0.6", only: [:dev, :test]},
       {:ex_doc, "~> 0.40", only: [:dev, :test], runtime: false},

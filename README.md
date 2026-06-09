@@ -42,14 +42,49 @@ detector sensitivity by that factor.
 
 Detectors take tensors or plain lists; batch scans are vectorized in Nx and
 the streaming forms (`Drift.step/2`, `Shift.step/2`) carry O(1) state per
-metric. Scheduling, alerting, and persistence are deliberately the caller's
-problem.
+metric. The detectors are deliberately pure and schedule-free; scheduling
+and findings are the optional runtime's job (below), while alert delivery
+and persistence stay the host app's, via telemetry.
+
+## The runtime
+
+You don't have to drive the detectors yourself. The optional `MobiusSmarts`
+supervision tree polls Mobius on an interval, runs the stack over every
+watched metric, and maintains *findings* and an aggregate health level:
+
+```elixir
+children = [
+  {Mobius, metrics: metrics()},
+  {MobiusSmarts,
+   config: [
+     watch: [
+       "vm.memory.used_percent",
+       [metric: "disk.used_percent", ceiling: 95.0],
+       [metric: "cpu.temp_c", ceiling: 85.0]
+     ],
+     false_alarm_budget: {1, :week}
+   ]}
+]
+
+MobiusSmarts.status()
+#=> %{level: :watch, concern: 1.2, findings: [...], ...}
+```
+
+There are no per-detector thresholds to tune: the configuration states one
+false-alarm budget ("this device may cry wolf about once a week") and every
+detector's threshold is derived from it via that detector's
+average-run-length math; baselines are fitted from the device's own stored
+history. Findings surface through `MobiusSmarts.status/0` and telemetry
+events — what to do with them (alarms, notifications, persistence) is the
+host app's call. The `MobiusSmarts` moduledoc has the full story: learning,
+finding lifecycle, health levels, telemetry.
 
 ## Installation
 
-> **Unreleased.** Not on Hex yet — this tracks the unreleased Mobius
-> `histograms` branch via a path dependency (`{:mobius, path: "../mobius"}`).
-> The snippet below is the intended shape once both are published.
+> **Unreleased.** Not on Hex yet — this tracks Mobius `main` on GitHub
+> (`{:mobius, github: "mobius-home/mobius", branch: "main"}`) for the
+> summary-window and histogram APIs not yet in a Hex release. The snippet
+> below is the intended shape once both are published.
 
 ```elixir
 def deps do
@@ -75,6 +110,8 @@ metrics.
 
 ## What lives where
 
+- `MobiusSmarts` — the optional runtime: supervision tree, config,
+  budget-derived calibration, findings and health level.
 - `MobiusSmarts.Source` — Mobius → tensors: summary window series,
   numeric series, DDSketch reconstruction.
 - `MobiusSmarts.Detect.*` — the detectors. Each module documents its
