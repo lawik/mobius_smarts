@@ -271,6 +271,48 @@ defmodule MobiusSmarts.Detect.OutlierTest do
         Outlier.load!([1, 2, 3])
       end
     end
+
+    test "sklearn's -2 leaf markers load and score identically to the -1 twin" do
+      # The same one-split tree twice: once in this module's convention
+      # (-1 at leaves), once verbatim-sklearn-shaped, where tree_.feature
+      # holds TREE_UNDEFINED = -2 (and threshold -2.0) at every leaf.
+      minus_one = Outlier.load!(base())
+
+      sklearn_tree = %{
+        hd(base()["trees"])
+        | "feature" => [0, -2, -2],
+          "threshold" => [10.0, -2.0, -2.0]
+      }
+
+      sklearn = Outlier.load!(%{base() | "trees" => [sklearn_tree]})
+
+      for x <- [[100.0], [5.0], [10.0], [-3.0]] do
+        assert Outlier.score(sklearn, x) == Outlier.score(minus_one, x)
+      end
+    end
+
+    test "a self-referential child index raises instead of looping at score time" do
+      tree = %{hd(base()["trees"]) | "left" => [0, -1, -1]}
+
+      assert_raise ArgumentError, ~r/tree 0, node 0/, fn ->
+        Outlier.load!(%{base() | "trees" => [tree]})
+      end
+    end
+
+    test "a child pointing back at an ancestor raises" do
+      # Node 1 is internal and points left back to the root: 0 -> 1 -> 0.
+      tree = %{
+        "feature" => [0, 0, -1, -1],
+        "threshold" => [10.0, 5.0, 0.0, 0.0],
+        "left" => [1, 0, -1, -1],
+        "right" => [2, 3, -1, -1],
+        "size" => [10, 9, 1, 4]
+      }
+
+      assert_raise ArgumentError, ~r/tree 0, node 1/, fn ->
+        Outlier.load!(%{base() | "trees" => [tree]})
+      end
+    end
   end
 
   describe "properties" do
