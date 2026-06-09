@@ -39,6 +39,11 @@ defmodule MobiusSmarts.Sweeper do
   @impl GenServer
   def handle_info(:sweep, state) do
     sweep(state)
+
+    # Scheduled after the sweep's work, so the effective cadence is
+    # sweep_interval + work time. Known and acceptable drift: every
+    # sweep re-scans trailing history, so nothing is missed —
+    # confirmation just lands a moment later.
     Process.send_after(self(), :sweep, Config.ms(state.config.sweep_interval))
     {:noreply, state}
   end
