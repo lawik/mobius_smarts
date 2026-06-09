@@ -26,11 +26,12 @@ defmodule MobiusSmarts.Detect.Drift do
   is a far better diagnostic than "alarm fired Friday".
 
   Input is the natural Mobius shape: the per-window `average` series of
-  a summary metric, with `target`/`sigma` taken from a healthy baseline
-  period — `target` and **`sigma_avg`** from
-  `MobiusSmarts.Detect.Jump.baseline/3`. Take care with the scale:
-  `sigma` here is the standard deviation *of the window averages*, not
-  the per-report `sigma_reports`; the two differ by
+  a summary metric, calibrated against a healthy baseline period. Pass
+  the map from `MobiusSmarts.Detect.Jump.baseline/3` as `:baseline`
+  and the detector picks the right fields (`target` and **`sigma_avg`**)
+  itself. Only when setting `:target`/`:sigma` by hand does the scale
+  footgun apply: `sigma` here is the standard deviation *of the window
+  averages*, not the per-report `sigma_reports`; the two differ by
   `sqrt(reports_per_window)` and using the per-report scale makes this
   detector nearly deaf.
 
@@ -92,12 +93,21 @@ defmodule MobiusSmarts.Detect.Drift do
 
   `values` is a 1D tensor (or list). Options:
 
-  - `:target` (required) — in-control mean, from a healthy baseline.
-  - `:sigma` (required) — in-control standard deviation **of the window
-    averages** over the same baseline (`sigma_avg` from
-    `MobiusSmarts.Detect.Jump.baseline/3`, not `sigma_reports`).
+  - `:baseline` — a map with `:target` and `:sigma_avg`, as returned by
+    `MobiusSmarts.Detect.Jump.baseline/3`; the detector reads those
+    two fields and ignores the rest (notably `:sigma_reports`, which is
+    the wrong scale here).
+  - `:target` — in-control mean, from a healthy baseline. Overrides the
+    baseline's `target`; required when no `:baseline` is given.
+  - `:sigma` — in-control standard deviation **of the window averages**
+    over the same baseline (the baseline's `sigma_avg`, not
+    `sigma_reports`). Overrides the baseline's `sigma_avg`; required
+    when no `:baseline` is given.
   - `:k` — drain rate in sigma units, default `0.5`.
   - `:h` — alarm threshold in sigma units, default `5.0`.
+
+  Either `:baseline` or both `:target` and `:sigma` must be supplied;
+  anything less raises an `ArgumentError`.
 
   Returns the upper/lower bucket-level series, the first alarm index
   for each side (`nil` when no alarm), and the onset index for each
@@ -119,6 +129,16 @@ defmodule MobiusSmarts.Detect.Drift do
       13
       iex> result.upper_onset
       9
+
+  The baseline map from `MobiusSmarts.Detect.Jump.baseline/3` plugs
+  in directly — `target` and `sigma_avg` are picked for you:
+
+      iex> alias MobiusSmarts.Detect.Drift
+      iex> baseline = %{target: 10.0, sigma_reports: 5.0, sigma_avg: 1.0}
+      iex> shifted = List.duplicate(10.0, 10) ++ List.duplicate(12.0, 10)
+      iex> result = Drift.scan(shifted, baseline: baseline)
+      iex> result.upper_alarm
+      13
   """
   @spec scan(Nx.Tensor.t() | [number()], keyword()) :: scan_result()
   def scan(values, opts)
@@ -131,8 +151,7 @@ defmodule MobiusSmarts.Detect.Drift do
 
   def scan(values, opts) do
     values = to_f64(values)
-    target = Keyword.fetch!(opts, :target)
-    sigma = Keyword.fetch!(opts, :sigma)
+    {target, sigma} = resolve_target_sigma!(opts)
     k = Keyword.get(opts, :k, 0.5)
     h = Keyword.get(opts, :h, 5.0)
 
@@ -155,12 +174,22 @@ defmodule MobiusSmarts.Detect.Drift do
 
   @doc """
   Initialize streaming drift-detection state. Same options as `scan/2`.
+
+  ## Examples
+
+      iex> alias MobiusSmarts.Detect.Drift
+      iex> baseline = %{target: 10.0, sigma_reports: 5.0, sigma_avg: 1.0}
+      iex> state = Drift.new(baseline: baseline)
+      iex> {state.target, state.sigma}
+      {10.0, 1.0}
   """
   @spec new(keyword()) :: state()
   def new(opts) do
+    {target, sigma} = resolve_target_sigma!(opts)
+
     %{
-      target: Keyword.fetch!(opts, :target) * 1.0,
-      sigma: Keyword.fetch!(opts, :sigma) * 1.0,
+      target: target * 1.0,
+      sigma: sigma * 1.0,
       k: Keyword.get(opts, :k, 0.5) * 1.0,
       h: Keyword.get(opts, :h, 5.0) * 1.0,
       upper: 0.0,
@@ -262,6 +291,35 @@ defmodule MobiusSmarts.Detect.Drift do
     |> Enum.with_index()
     |> Enum.reverse()
     |> Enum.find_value(0, fn {v, i} -> if v == 0.0, do: i end)
+  end
+
+  # Explicit :target/:sigma win over the :baseline map, field by field;
+  # without a baseline both are required.
+  defp resolve_target_sigma!(opts) do
+    case Keyword.get(opts, :baseline) do
+      %{target: target, sigma_avg: sigma_avg} ->
+        {Keyword.get(opts, :target, target), Keyword.get(opts, :sigma, sigma_avg)}
+
+      nil ->
+        with {:ok, target} <- Keyword.fetch(opts, :target),
+             {:ok, sigma} <- Keyword.fetch(opts, :sigma) do
+          {target, sigma}
+        else
+          :error ->
+            raise ArgumentError,
+                  "no in-control level/noise scale: pass baseline: (the map from " <>
+                    "MobiusSmarts.Detect.Jump.baseline/3 — its :target and :sigma_avg " <>
+                    "are read) or both :target and :sigma explicitly. If setting :sigma " <>
+                    "by hand, use the baseline's sigma_avg — sigma_reports is a " <>
+                    "different scale (off by sqrt(reports_per_window)) and makes this " <>
+                    "detector nearly deaf."
+        end
+
+      other ->
+        raise ArgumentError,
+              ":baseline must be a map with :target and :sigma_avg, as returned by " <>
+                "MobiusSmarts.Detect.Jump.baseline/3; got: #{inspect(other)}"
+    end
   end
 
   defp to_f64(values) when is_list(values), do: Nx.tensor(values, type: :f64)

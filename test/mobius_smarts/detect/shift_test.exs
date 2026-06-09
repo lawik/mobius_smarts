@@ -59,6 +59,58 @@ defmodule MobiusSmarts.Detect.ShiftTest do
     end
   end
 
+  describe "the :baseline option" do
+    # The map shape returned by Jump.baseline/3, carrying both noise
+    # scales — the chart must pick sigma_avg, never sigma_reports.
+    @baseline %{target: 50.0, sigma_reports: 10.0, sigma_avg: 2.0}
+
+    test "chart reads target and sigma_avg from the baseline map" do
+      values = List.duplicate(50.0, 15) ++ List.duplicate(53.0, 15)
+
+      explicit = Shift.chart(values, target: 50.0, sigma: 2.0)
+      from_baseline = Shift.chart(values, baseline: @baseline)
+
+      assert from_baseline.first_violation == explicit.first_violation
+      assert Nx.to_flat_list(from_baseline.smoothed) == Nx.to_flat_list(explicit.smoothed)
+      assert Nx.to_flat_list(from_baseline.ucl) == Nx.to_flat_list(explicit.ucl)
+      assert Nx.to_flat_list(from_baseline.lcl) == Nx.to_flat_list(explicit.lcl)
+    end
+
+    test "new reads target and sigma_avg from the baseline map" do
+      assert Shift.new(baseline: @baseline) == Shift.new(target: 50.0, sigma: 2.0)
+    end
+
+    test "explicit :target and :sigma win over the baseline" do
+      values = List.duplicate(50.0, 15) ++ List.duplicate(53.0, 15)
+      deaf = %{target: 0.0, sigma_reports: 2.0, sigma_avg: 200.0}
+
+      overridden = Shift.chart(values, baseline: deaf, target: 50.0, sigma: 2.0)
+      explicit = Shift.chart(values, target: 50.0, sigma: 2.0)
+
+      assert overridden.first_violation == explicit.first_violation
+      assert Nx.to_flat_list(overridden.ucl) == Nx.to_flat_list(explicit.ucl)
+
+      assert Shift.new(baseline: deaf, target: 50.0, sigma: 2.0) ==
+               Shift.new(target: 50.0, sigma: 2.0)
+    end
+
+    test "neither a baseline nor both explicit values raises pointedly" do
+      assert_raise ArgumentError, ~r/sigma_avg/, fn -> Shift.chart([1.0], []) end
+      assert_raise ArgumentError, ~r/sigma_avg/, fn -> Shift.chart([1.0], sigma: 2.0) end
+      assert_raise ArgumentError, ~r/sigma_avg/, fn -> Shift.new(target: 50.0) end
+    end
+
+    test "a baseline without :sigma_avg raises instead of guessing a scale" do
+      assert_raise ArgumentError, ~r/sigma_avg/, fn ->
+        Shift.chart([1.0], baseline: %{target: 50.0, sigma_reports: 10.0})
+      end
+
+      assert_raise ArgumentError, ~r/sigma_avg/, fn ->
+        Shift.new(baseline: %{target: 50.0, sigma_reports: 10.0})
+      end
+    end
+  end
+
   describe "detection behavior" do
     test "stays quiet on in-control noise" do
       # In-control ARL for EWMA(0.2, L=3) is ~500 windows; a 200-window
