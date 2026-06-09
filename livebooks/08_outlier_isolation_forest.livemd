@@ -217,8 +217,9 @@ Now the ship-to-device step. We turn each tree into the documented
 columnar shape: parallel `feature`, `threshold`, `left`, `right`,
 `size` arrays where node `0` is the root, `-1` marks a leaf, and you go
 **left when `x[feature] <= threshold`**. This is the same shape the
-`sklearn` exporter in the moduledoc produces — the device cannot tell
-where the forest came from.
+`sklearn` exporter in the moduledoc produces (sklearn's own arrays mark
+leaves with `-2` in `feature`; `load!/1` accepts and normalizes that) —
+the device cannot tell where the forest came from.
 
 ```elixir
 defmodule Export do

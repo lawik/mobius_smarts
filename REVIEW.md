@@ -10,6 +10,16 @@ code and hunted for what they missed.
 **Checks at review time:** `mix test` — 48 doctests, 16 properties, 138
 tests, 0 failures.
 
+> **Resolution (2026-06-09, same day):** every actionable finding below
+> was addressed in the merge series `f8af981..1bf3542` — one
+> reproducing-test-first branch per finding cluster — plus a follow-up
+> docs pass (O2's `TODO` link, the CHANGELOG stub, README/SPEC/livebook
+> drift). The recipes layer (N2, N3, and the recipe half of L1/L2) was
+> removed outright rather than fixed. Seasonal baselines (the deep half
+> of R1) remain SPEC's open thread; R5's real fix remains upstream in
+> Mobius, now caveated in `Source.summary_series/3`. Everything below is
+> preserved as written — a record of the state at b964cdc.
+
 ## Verdict
 
 The math that the two earlier reviews pinned down is genuinely correct — I

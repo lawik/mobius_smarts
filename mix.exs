@@ -5,6 +5,7 @@ defmodule MobiusSmarts.MixProject do
     [
       app: :mobius_smarts,
       version: "0.1.0",
+      source_url: "https://github.com/lawik/mobius_smarts",
       elixir: "~> 1.19",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
@@ -33,6 +34,7 @@ defmodule MobiusSmarts.MixProject do
       extra_section: "GUIDES",
       extras: [
         "README.md",
+        "CHANGELOG.md",
         "SPEC.md": [title: "Design spec"]
       ],
       groups_for_modules: [
@@ -42,6 +44,9 @@ defmodule MobiusSmarts.MixProject do
           MobiusSmarts.Config.Metric,
           MobiusSmarts.Finding,
           MobiusSmarts.Calibrate
+        ],
+        Source: [
+          MobiusSmarts.Source
         ],
         Detectors: [
           MobiusSmarts.Detect,
@@ -62,7 +67,7 @@ defmodule MobiusSmarts.MixProject do
     [
       name: :mobius_smarts,
       licenses: ["Apache-2.0"],
-      links: %{"GitHub" => "https://github.com/TODO/mobius_smarts"}
+      links: %{"GitHub" => "https://github.com/lawik/mobius_smarts"}
     ]
   end
 

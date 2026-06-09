@@ -27,18 +27,20 @@ alias MobiusSmarts.{Detect, Source}
 
 baseline = Detect.Jump.baseline(avgs, stds, counts)
 
-# Drift/Shift watch the average series — they take sigma_avg.
-Detect.Drift.scan(avgs, target: baseline.target, sigma: baseline.sigma_avg)
+# Each detector picks its own noise scale from the baseline map.
+Detect.Drift.scan(avgs, baseline: baseline)
 #=> %{upper_alarm: 161, upper_onset: 142, ...}
 
-# Jump scales its own limits by sqrt(n) — it takes the baseline map.
 Detect.Jump.scan(avgs, stds, counts, baseline: baseline)
 ```
 
-Mind the two sigma scales: `baseline.sigma_avg` (sd of the window averages)
-calibrates Drift/Shift; `baseline.sigma_reports` (per-report sd) calibrates
-Jump. They differ by `sqrt(reports_per_window)`, and the wrong one changes
-detector sensitivity by that factor.
+The baseline map carries two distinct noise scales — `sigma_avg` (sd of
+the window averages, what Drift/Shift calibrate against) and
+`sigma_reports` (per-report sd, what Jump's `sqrt(n)`-scaled limits
+want). They differ by `sqrt(reports_per_window)`, and the wrong one
+changes detector sensitivity by that factor — which is why the
+recommended wiring is to hand every detector the map and let it pick.
+Explicit `:target`/`:sigma` options remain for overrides.
 
 Detectors take tensors or plain lists; batch scans are vectorized in Nx and
 the streaming forms (`Drift.step/2`, `Shift.step/2`) carry O(1) state per
@@ -106,7 +108,7 @@ microseconds-to-milliseconds at RRD scale on either backend; `Detect.Trend`'s
 Elixir — its moduledoc has the numbers and the scheduling guidance). Quoted
 false-alarm rates assume independent windows; see the calibration caveat in
 `MobiusSmarts.Detect` before trusting them on seasonal or autocorrelated
-metrics.
+metrics (`Detect.lag1_autocorrelation/1` is the quick check).
 
 ## What lives where
 

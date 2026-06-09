@@ -429,8 +429,11 @@ end).()
 ```
 
 Theil–Sen reads ~0.42%/hour — the honest rate. OLS reads ~0.52%/hour, inflated by
-the lone 99% glitch. Now `eta_to_threshold/3`: it takes the robust slope, measures
-the gap from the latest value to the ceiling, and projects forward.
+the lone 99% glitch. Now `eta_to_threshold/3`: it takes the robust slope, anchors
+at the fitted line's value at the last timestamp — so even a glitch in the *final*
+sample can't move the answer — and projects forward to the ceiling. (If you
+already have a fit, `Trend.eta_from_fit/3` does the same projection without
+re-running the O(n²) slope.)
 
 ```elixir
 threshold = 95.0

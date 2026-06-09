@@ -141,7 +141,11 @@ spread settles to a fixed `sigma² · lambda / (2 - lambda)`. The band is
 just the target plus/minus `L` times the square root of that variance
 (`L = 3` by default, the usual "3-sigma" width).
 
-`Shift.chart/2` computes all of this. Here it is on a healthy series:
+`Shift.chart/2` computes all of this. (We pass `target:`/`sigma:`
+explicitly because this notebook invents them; on real Mobius data,
+hand the map from `MobiusSmarts.Detect.Jump.baseline/3` straight to
+`Shift.chart(avgs, baseline: baseline)` — it picks the right noise
+scale, `sigma_avg`, itself.) Here it is on a healthy series:
 
 ```elixir
 :rand.seed(:exsss, {171, 342, 513})

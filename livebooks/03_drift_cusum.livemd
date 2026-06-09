@@ -37,9 +37,9 @@ The mental model for this whole notebook: a **bucket that collects
 suspicion**. Every window slightly above normal adds a few drops; a
 drain empties it as fast as honest noise fills it, so on healthy data
 the bucket hovers near empty forever. A real leak fills slightly faster
-than the drain empties, so the level ratchets up and eventually
-overflows an alarm line. Rewind to when the bucket was last empty and
-you have the onset.
+than the drain empties, so the level ratchets up until it reaches an
+alarm line — the alarm fires the moment the level touches the line.
+Rewind to when the bucket was last empty and you have the onset.
 
 ## Spot the leak
 
@@ -103,6 +103,12 @@ Kino.DataTable.new([
 Series A: no alarm. Series B: alarm at window 96, and an estimated
 onset of window 84 — within four windows of the true start (80) we
 injected. We never told it where to look. Now let's open the box.
+
+(We pass `target:`/`sigma:` explicitly because this notebook invents
+them. On real Mobius data, hand the whole map from
+`MobiusSmarts.Detect.Jump.baseline/3` straight to
+`Drift.scan(avgs, baseline: baseline)` — it picks the right noise
+scale, `sigma_avg`, itself.)
 
 ## The bucket, built by hand
 
@@ -174,7 +180,7 @@ rises when noise clusters high, each one draining straight back down.
 It tops out around 4.3, never reaching an alarm line of 5. This is what
 "in control" looks like: the bucket can't fill on noise alone.
 
-## The drift case: the bucket overflows
+## The drift case: the bucket reaches the alarm line
 
 Same construction on the **leaking** series. Now we let the official
 `Drift.scan` draw the alarm line `h = 5` and the points, and we overlay
@@ -217,7 +223,7 @@ Vl.new(width: 700, height: 300, title: "Suspicion bucket — leaking series")
 
 Watch the bucket: flat and near-empty until the leak begins, then a
 steady **ratchet upward** — each window adds a little more than the
-drain removes — until it overflows the dashed red line. The red dot is
+drain removes — until it reaches the dashed red line. The red dot is
 the alarm (window 96); the green dot at the bottom is the detected
 onset (window 84); the gray dashed line is the true start (window 80).
 
@@ -295,7 +301,7 @@ The alarm line `h` trades two costs against each other: lower `h`
 catches drifts sooner but false-alarms more often on healthy data;
 higher `h` is quieter but slower. The key fact is *how* that trade
 scales. Let's measure it directly — run many healthy series and see how
-long, on average, a bucket survives before a false overflow.
+long, on average, a bucket survives before a false alarm.
 
 This is a **Monte Carlo** estimate: simulate a process many times and
 average the outcomes. Keep it modest (200 runs, up to 3000 windows each)
@@ -376,7 +382,7 @@ IO.puts("streaming alarm at window #{alarm_step}, onset #{onset_at_alarm}")
 ```
 
 Streaming reports alarm at window 96 and onset 84 — **identical** to
-the batch `scan` result above. Same bucket, same overflow, fed one drop
+the batch `scan` result above. Same bucket, same alarm, fed one drop
 at a time.
 
 ## For the curious: how scan skips the loop
@@ -411,7 +417,7 @@ are the same computation.
 
 CUSUM is tuned for the *small and slow*. It is deliberately patient,
 which makes it the wrong tool for the *big and sudden*. A sharp jump
-overflows the bucket eventually, but the bucket still has to fill — so a
+fills the bucket quickly, but the bucket still has to fill — so a
 dedicated per-window tripwire beats it on speed.
 
 ```elixir
@@ -439,11 +445,11 @@ tripwire_window =
 
 IO.puts("jump landed at window #{jump_at}")
 IO.puts("Shewhart tripwire (>3 sigma) fires at window #{tripwire_window}")
-IO.puts("CUSUM bucket overflows at window #{jump_drift.upper_alarm}")
+IO.puts("CUSUM bucket hits the alarm line at window #{jump_drift.upper_alarm}")
 ```
 
 The tripwire fires at window 100, the instant the jump lands; the
-bucket needs a window to fill and overflows at 101. One window is small
+bucket needs a window to fill and hits the line at 101. One window is small
 here, but for a step you don't want to *wait* for — that's
 `MobiusSmarts.Detect.Jump` (Shewhart charts, `01_jump_shewhart_charts.livemd`).
 

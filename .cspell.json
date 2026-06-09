@@ -24,6 +24,7 @@
     "test"
   ],
   "words": [
+    "acyclicity",
     "alignable",
     "anom",
     "anticonservative",
@@ -54,8 +55,11 @@
     "hrules",
     "iforest",
     "maxbins",
+    "miscalibrated",
     "missingness",
     "nbins",
+    "nstandard",
+    "overclaims",
     "overpromise",
     "pctile",
     "probit",

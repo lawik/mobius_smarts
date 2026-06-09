@@ -17,7 +17,8 @@ Mobius summary windows store sufficient statistics per window: average,
 std_dev, report count. That is *exactly* the subgroup format classical SPC
 (X̄/S charts) was designed for — no approximation involved. The std_dev
 solves the hardest practical problem in drift detection for free: estimating
-the noise scale that calibrates CUSUM/EWMA thresholds. The DDSketch
+the noise scale that calibrates CUSUM/EWMA thresholds (mind the precision
+caveat in `Source.summary_series/3` for large-magnitude metrics). The DDSketch
 histograms carry distribution shape — the failure modes (p99 drift,
 bimodality) that are mathematically invisible to the first two moments.
 
@@ -30,10 +31,11 @@ bimodality) that are mathematically invisible to the first two moments.
   state, never detection logic, and the detectors stay fully usable
   without it.
 - **Batch and streaming forms.** Batch scans are vectorized in Nx (CUSUM via
-  the reflection identity, change-point scans via prefix sums, Theil-Sen via
-  pairwise matrices). Sequential recursions that Nx can't vectorize (EWMA)
-  run as plain folds — at RRD scale that is microseconds. Streaming forms
-  (`Drift.step/2`, `Shift.step/2`) carry O(1) float state per metric.
+  the reflection identity, change-point scans via prefix sums). Sequential
+  recursions that Nx can't vectorize (EWMA) run as plain folds — at RRD
+  scale that is microseconds — and Trend is plain Elixir by measurement
+  (see the Nx strategy section). Streaming forms (`Drift.step/2`,
+  `Shift.step/2`) carry O(1) float state per metric.
 - **BYO backend.** `nx` is the only hard runtime dep besides `mobius`.
   `nx_eigen` is the recommended backend on Nerves targets (CPU SIMD, no
   XLA/LLVM toolchain); `Nx.BinaryBackend` is fine for CI and is what the
@@ -66,12 +68,19 @@ which-detector-for-which-failure-mode table.
 | Module | Theory | Mobius input |
 |---|---|---|
 | `Jump` | Shewhart X̄/S with c4 correction, pooled sigma | averages + std_devs + counts |
-| `Drift` | Page's CUSUM, two-sided, onset estimation | averages (+ sigma from baseline) |
-| `Shift` | Lucas & Saccucci EWMA chart, exact time-varying limits | averages (+ sigma) |
+| `Drift` | Page's CUSUM, two-sided, onset estimation | averages (+ baseline map) |
+| `Shift` | Lucas & Saccucci EWMA chart, exact time-varying limits | averages (+ baseline map) |
 | `Trend` | Theil-Sen, Mann-Kendall, threshold ETA | trailing averages (+ timestamps) |
 | `Changepoint` | binary segmentation, SSE cost, BIC-style penalty, robust sigma | trailing averages |
 | `Shape` | PSI, Jensen-Shannon, Wasserstein over aligned bins | DDSketch pairs |
 | `Novelty` | covariance-aware distance, ridge-stabilized | per-window means across metrics |
+| `Outlier` | Isolation Forest (Liu et al. 2008), inference only | window vectors + fleet-trained model |
+
+Drift and Shift accept the map from `Jump.baseline/3` directly
+(`baseline:` option) and select the correct sigma scale themselves;
+explicit `:target`/`:sigma` remain as overrides. The umbrella `Detect`
+module also carries `lag1_autocorrelation/1`, the quick check behind
+its calibration caveat.
 
 Detector outputs favor *diagnosis* over bare booleans: CUSUM dates the onset
 of a shift, not just its detection; Trend returns ETAs in seconds; the
@@ -172,6 +181,10 @@ point of diminishing returns.
   prerequisite for the quoted false-alarm rates, not an enhancement; the
   Hamed–Rao autocorrelation correction for Mann–Kendall belongs in the
   same bundle.
+- Done: the caveat's first checklist step is executable —
+  `Detect.lag1_autocorrelation/1` measures whether a window series is
+  independent enough for the quoted rates. Seasonal baselines and
+  Hamed–Rao (above) remain the open half.
 - Done: Trend rewritten in plain Elixir after benchmarking — Mann–Kendall
   is now O(n log n) inversion counting (sub-ms at any RRD scale),
   Theil–Sen a plain O(n²) loop (~100 ms at n = 1000, ~35× faster than
