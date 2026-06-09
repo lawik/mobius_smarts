@@ -38,6 +38,12 @@ defmodule MobiusSmarts.Detect.Trend do
     n ≈ 2000 — slower again on a device core, so schedule sweeps
     accordingly and aggregate to coarser windows for long horizons. A
     day of 5-minute windows (n = 288, ~10 ms) is plenty for a trend.
+    Memory tracks the same `n(n − 1)/2`: all pair slopes are
+    materialized as a BEAM list before the median — at n = 1440 (a day
+    of minute windows) that is ~1M boxed floats, tens of MB of
+    transient process heap. If long horizons on-device ever matter,
+    sampled Theil–Sen or the repeated-median estimator bounds time and
+    memory alike.
 
   Mann–Kendall's p-value assumes independent observations — under
   positive autocorrelation it is severely anticonservative (the
@@ -180,6 +186,10 @@ defmodule MobiusSmarts.Detect.Trend do
   ceilings above the data (disk filling) and floors below it (battery
   draining) alike.
 
+  The projection is anchored on the *fitted* value at the last
+  timestamp, not the raw final sample, so one noisy final window
+  cannot swing the ETA — the same robustness the slope already has.
+
   ## Examples
 
       iex> alias MobiusSmarts.Detect.Trend
@@ -196,11 +206,34 @@ defmodule MobiusSmarts.Detect.Trend do
           number()
         ) :: {:eta, float()} | :not_approaching
   def eta_to_threshold(values, timestamps, threshold) do
-    values = to_list(values)
-    %{slope: slope} = theil_sen(values, timestamps)
+    timestamps = to_list(timestamps)
+    fit = theil_sen(values, timestamps)
+    eta_from_fit(fit, List.last(timestamps), threshold)
+  end
 
-    last = List.last(values)
-    gap = threshold - last
+  @doc """
+  `eta_to_threshold/3` for a precomputed Theil–Sen `fit` — when one
+  fit serves several thresholds (ceiling and floor), compute it once
+  with `theil_sen/2` and project each crossing from here, instead of
+  paying the `O(n²)` fit per threshold.
+
+  Anchors on the fitted value `slope * last_timestamp + intercept` and
+  returns `{:eta, seconds_from_last_timestamp}` or `:not_approaching`,
+  exactly as `eta_to_threshold/3` does.
+
+  ## Examples
+
+      iex> alias MobiusSmarts.Detect.Trend
+      iex> fit = %{slope: 1.0 / 3600, intercept: 46.0}
+      iex> {:eta, seconds} = Trend.eta_from_fit(fit, 24 * 3600, 95.0)
+      iex> round(seconds / 3600)
+      25
+  """
+  @spec eta_from_fit(%{slope: float(), intercept: float()}, number(), number()) ::
+          {:eta, float()} | :not_approaching
+  def eta_from_fit(%{slope: slope, intercept: intercept}, last_timestamp, threshold) do
+    fitted = slope * last_timestamp + intercept
+    gap = threshold - fitted
 
     if slope != 0.0 and gap * slope > 0 do
       {:eta, gap / slope}

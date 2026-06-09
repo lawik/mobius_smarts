@@ -107,5 +107,33 @@ defmodule MobiusSmarts.Detect.TrendTest do
       ts = Enum.map(0..10, &(&1 * 3600))
       assert Trend.eta_to_threshold(List.duplicate(50.0, 11), ts, 95.0) == :not_approaching
     end
+
+    test "anchors the projection on the fitted line, not a final-sample outlier" do
+      # Exact line v = t / 3600 (one unit per hour) whose FINAL sample is
+      # a wild outlier. Hand computation: 276 of the 300 pairwise slopes
+      # avoid the outlier and are exactly 1/3600, so the Theil-Sen slope
+      # is 1/3600; the intercept is the median of 24 zero residuals and
+      # one 476.0, i.e. 0.0. The fitted value at the last timestamp
+      # (t = 24 * 3600) is 24.0, so a 100.0 ceiling is
+      # (100 - 24) / (1/3600) = 273_600 seconds out. Anchoring on the
+      # raw final sample (500.0, already past the ceiling) would say
+      # :not_approaching instead.
+      ts = Enum.map(0..24, &(&1 * 3600))
+      values = Enum.map(0..23, &(&1 * 1.0)) ++ [500.0]
+
+      assert {:eta, seconds} = Trend.eta_to_threshold(values, ts, 100.0)
+      assert_in_delta seconds, 273_600.0, 1.0e-6
+    end
+
+    test "equals eta_from_fit/3 on a precomputed fit, for ceiling and floor alike" do
+      ts = Enum.map(0..20, &(&1 * 3600))
+      values = Enum.map(0..20, &(50.0 + 1.5 * &1 + 3.0 * rem(&1, 3)))
+      fit = Trend.theil_sen(values, ts)
+
+      for threshold <- [95.0, 10.0] do
+        assert Trend.eta_to_threshold(values, ts, threshold) ==
+                 Trend.eta_from_fit(fit, List.last(ts), threshold)
+      end
+    end
   end
 end

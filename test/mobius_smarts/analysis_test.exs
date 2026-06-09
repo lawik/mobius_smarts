@@ -245,6 +245,25 @@ defmodule MobiusSmarts.AnalysisTest do
       assert [candidate] = Analysis.trend_candidates(lists, metric, config())
       assert candidate.kind == :approaching_limit
     end
+
+    test "evidence matches an independent per-threshold Trend computation exactly" do
+      # The candidate path computes the Theil-Sen fit once and reuses it
+      # for every threshold; this pins that restructure to the values the
+      # public per-call API produces.
+      seeded(35)
+      values = Enum.map(0..47, &(46.0 + &1 * 0.5 + noise(0.1)))
+      lists = windows(values, cadence: 1800)
+      metric = %Config.Metric{name: "disk", ceiling: 95.0}
+
+      alias MobiusSmarts.Detect.Trend
+      assert {:eta, eta_s} = Trend.eta_to_threshold(lists.avg, lists.ts, 95.0)
+      %{slope: slope} = Trend.theil_sen(lists.avg, lists.ts)
+
+      assert [candidate] = Analysis.trend_candidates(lists, metric, config())
+      assert candidate.evidence.eta_s == eta_s
+      assert candidate.evidence.slope_per_hour == slope * 3600.0
+      assert candidate.evidence.threshold == 95.0
+    end
   end
 
   describe "changepoint_candidates/1" do
