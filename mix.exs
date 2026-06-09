@@ -33,11 +33,7 @@ defmodule MobiusSmarts.MixProject do
       extra_section: "GUIDES",
       extras: [
         "README.md",
-        "SPEC.md": [title: "Design spec"],
-        "guides/recipes/overview.md": [title: "Recipes — overview"]
-      ],
-      groups_for_extras: [
-        Recipes: ~r"guides/recipes/.*"
+        "SPEC.md": [title: "Design spec"]
       ],
       groups_for_modules: [
         Runtime: [
@@ -57,10 +53,6 @@ defmodule MobiusSmarts.MixProject do
           MobiusSmarts.Detect.Shape,
           MobiusSmarts.Detect.Novelty,
           MobiusSmarts.Detect.Outlier
-        ],
-        Recipes: [
-          MobiusSmarts.Recipes.CoreNx,
-          MobiusSmarts.Recipes.DefnKernels
         ]
       ]
     ]

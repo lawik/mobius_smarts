@@ -74,12 +74,6 @@ of a shift, not just its detection; Trend returns ETAs in seconds; the
 change-point sweep returns the regime boundaries worth correlating with the
 event log.
 
-### `MobiusSmarts.Recipes` — general-purpose tensor recipes
-
-`CoreNx` (rates from counters, rolling stats, z-scores, bucketed histograms)
-and `DefnKernels` (events-per-hour, duty cycles, run lengths). Kept from the
-library's first life as documented, doctested building blocks.
-
 ## Data shapes expected on a Nerves device
 
 | Shape | Examples | Detector path |
@@ -87,8 +81,8 @@ library's first life as documented, doctested building blocks.
 | Smooth gauge | cpu_temp, mem_used_pct, voltage | summary windows → Jump/Shift/Drift/Trend |
 | Noisy gauge | accelerometer, mic level | summary windows; S chart carries most signal |
 | Latency-like | request duration, queue wait | DDSketch → Shape (p99/shape drift) |
-| Binary state | relay on, link up | Recipes (duty cycle, transitions) |
-| Monotonic counter | bytes_rx, gc_count | Recipes.mean_rate → then gauge-style detection |
+| Binary state | relay on, link up | caller-computed duty cycle / transition counts |
+| Monotonic counter | bytes_rx, gc_count | rate-convert first (first-difference, mask resets) → then gauge-style detection |
 | Many metrics | full health snapshot | Novelty over window-mean vectors |
 
 ## Nx strategy — how accelerated, and why not more

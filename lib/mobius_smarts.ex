@@ -19,7 +19,6 @@ defmodule MobiusSmarts do
   - **`MobiusSmarts.Source`** — Mobius data (via `Mobius.Data`) as Nx
     tensors.
 
-  General-purpose tensor recipes live under `MobiusSmarts.Recipes`.
   This library does not pick an Nx backend; `nx_eigen` is recommended
   on Nerves targets, and `Nx.BinaryBackend` works everywhere at RRD
   scale.

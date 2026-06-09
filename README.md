@@ -79,8 +79,6 @@ metrics.
   numeric series, DDSketch reconstruction.
 - `MobiusSmarts.Detect.*` — the detectors. Each module documents its
   theory, tuning knobs, and blind spots.
-- `MobiusSmarts.Recipes.*` — general-purpose tensor recipes for
-  Mobius-shaped data (rates from counters, duty cycles, bucketed histograms).
 
 Tests are split the same way: per-detector conformance tests pin the
 implementations to the textbook math (hand-computed statistics, closed forms,
