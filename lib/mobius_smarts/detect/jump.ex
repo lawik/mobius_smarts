@@ -47,6 +47,16 @@ defmodule MobiusSmarts.Detect.Jump do
 
   import Nx.Defn
 
+  defmodule NoDispersionError do
+    @moduledoc """
+    Raised by `MobiusSmarts.Detect.Jump.baseline/3` (and `scan/4` in
+    phase I, when it estimates its own baseline) when every window has
+    fewer than 2 reports, so there is no within-window dispersion to
+    pool into a sigma estimate.
+    """
+    defexception [:message]
+  end
+
   @type result() :: %{
           grand_mean: float(),
           pooled_sigma: float(),
@@ -95,11 +105,19 @@ defmodule MobiusSmarts.Detect.Jump do
           Nx.Tensor.t() | [number()] | pos_integer(),
           keyword()
         ) :: result()
-  def scan(averages, std_devs, counts, opts \\ []) do
+  def scan(averages, std_devs, counts, opts \\ [])
+
+  def scan([], _std_devs, _counts, _opts) do
+    raise ArgumentError,
+          "cannot scan an empty series — MobiusSmarts.Source returns :empty " <>
+            "for windows with no data; handle that before detection"
+  end
+
+  def scan(averages, std_devs, counts, opts) do
     averages = to_f64(averages)
     std_devs = to_f64(std_devs)
     n = Nx.size(averages)
-    counts = broadcast_counts(counts, n)
+    counts = counts |> broadcast_counts(n) |> validate_counts!()
     limit = Keyword.get(opts, :limit, 3.0) * 1.0
 
     {grand_mean, pooled_sigma} =
@@ -154,6 +172,12 @@ defmodule MobiusSmarts.Detect.Jump do
           Nx.Tensor.t() | [number()],
           Nx.Tensor.t() | [number()] | pos_integer()
         ) :: %{target: float(), sigma_reports: float(), sigma_avg: float()}
+  def baseline([], _std_devs, _counts) do
+    raise ArgumentError,
+          "cannot estimate a baseline from an empty series — MobiusSmarts.Source " <>
+            "returns :empty for windows with no data; handle that before detection"
+  end
+
   def baseline(averages, std_devs, counts) do
     averages = to_f64(averages)
     std_devs = to_f64(std_devs)
@@ -179,7 +203,7 @@ defmodule MobiusSmarts.Detect.Jump do
     dof = Nx.max(Nx.subtract(counts, 1.0), 0.0)
 
     if Nx.to_number(Nx.sum(dof)) == 0 do
-      raise ArgumentError,
+      raise NoDispersionError,
             "cannot estimate a baseline sigma: every window has fewer than 2 reports, " <>
               "so there is no within-window dispersion to pool. Pass an explicit " <>
               ":baseline or use windows with more reports."
@@ -222,6 +246,23 @@ defmodule MobiusSmarts.Detect.Jump do
     do: Nx.broadcast(Nx.tensor(counts, type: :f64), {n})
 
   defp broadcast_counts(counts, _n), do: to_f64(counts)
+
+  # A count below 1 is impossible data — a Mobius summary window always
+  # contains at least one report — and it silently corrupts the charts:
+  # c4 hits 4/3 at n = 0 (sqrt of a negative → NaN wobble limits) and
+  # rsqrt(0) blows the jump band out to ±infinity.
+  defp validate_counts!(counts) do
+    min = counts |> Nx.reduce_min() |> Nx.to_number()
+
+    if min < 1 do
+      raise ArgumentError,
+            "every window count must be >= 1, got #{min} — a Mobius summary window " <>
+              "always contains at least one report; counts below 1 make the c4 wobble " <>
+              "correction undefined (NaN limits) and the jump band infinite"
+    end
+
+    counts
+  end
 
   defp to_f64(values) when is_list(values), do: Nx.tensor(values, type: :f64)
   defp to_f64(values), do: Nx.as_type(values, :f64)

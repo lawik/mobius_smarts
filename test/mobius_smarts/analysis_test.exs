@@ -113,6 +113,27 @@ defmodule MobiusSmarts.AnalysisTest do
       lists = windows(List.duplicate(42.0, 100), std: 0.0)
       assert {:error, :zero_variance} = Analysis.fit_baseline(lists, min_windows: 60, now: 0)
     end
+
+    test "windows of single reports carry no dispersion: a learning state, not a crash" do
+      seeded(14)
+      values = Enum.map(1..100, fn _ -> 50.0 + noise(1.0) end)
+      lists = windows(values, reports: 1, std: 0.0)
+
+      assert {:error, :no_dispersion} = Analysis.fit_baseline(lists, min_windows: 60, now: 0)
+    end
+
+    test "the no-dispersion rescue does not swallow unrelated ArgumentErrors" do
+      seeded(15)
+      values = Enum.map(1..100, fn _ -> 50.0 + noise(1.0) end)
+      lists = windows(values)
+      # A malformed window count is a programming error, not a learning
+      # state — it must raise, not read as {:error, :no_dispersion}.
+      lists = %{lists | reports: List.replace_at(lists.reports, 50, 0)}
+
+      assert_raise ArgumentError, ~r/count/, fn ->
+        Analysis.fit_baseline(lists, min_windows: 60, now: 0)
+      end
+    end
   end
 
   describe "tick_candidates/4" do
@@ -200,6 +221,32 @@ defmodule MobiusSmarts.AnalysisTest do
 
       assert Enum.find(candidates, &(&1.kind == :wobbling))
       refute Enum.find(candidates, &(&1.kind == :jumped))
+    end
+
+    test "a collapsed spread (stuck sensor) wobbles with a bounded concern" do
+      seeded(26)
+      # Healthy spread throughout, then the last window goes perfectly
+      # flat: below the wobble band's lower limit with std = 0.0.
+      stds = List.duplicate(1.0, 119) ++ [0.0]
+      values = Enum.map(stds, fn s -> 50.0 + noise(s / :math.sqrt(30)) end)
+
+      lists = %{
+        ts: Enum.map(0..119, &(1_700_000_000 + &1 * 60)),
+        avg: values,
+        std: stds,
+        reports: List.duplicate(30, 120)
+      }
+
+      candidates =
+        Analysis.tick_candidates(lists, healthy_baseline(50.0, 0.2), calib(), config())
+
+      assert wobbling = Enum.find(candidates, &(&1.kind == :wobbling))
+      assert wobbling.severity in [:warning, :critical]
+      # Concern must stay comparable to other detectors' concerns — a
+      # ratio against std would explode toward 1e12 here and poison the
+      # Board's max-concern aggregation.
+      assert wobbling.concern >= 1.0
+      assert wobbling.concern < 100.0
     end
   end
 

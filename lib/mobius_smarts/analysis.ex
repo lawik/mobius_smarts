@@ -144,8 +144,9 @@ defmodule MobiusSmarts.Analysis do
       {:error, :zero_variance}
     end
   rescue
-    # Jump.baseline raises when no window carries dispersion information.
-    ArgumentError -> {:error, :no_dispersion}
+    # Jump.baseline raises when no window carries dispersion information
+    # — a learning state, not a bug. Anything else propagates.
+    Jump.NoDispersionError -> {:error, :no_dispersion}
   end
 
   defp reject_flagged(lists, flagged) do
@@ -237,8 +238,21 @@ defmodule MobiusSmarts.Analysis do
         ucl = Enum.at(wobble_ucl, last)
         lcl = Enum.at(wobble_lcl, last)
 
+        # Above the band: how many UCLs of spread (unbounded is fine —
+        # std really can be arbitrarily large). Below the band: measure
+        # the shortfall in band-half-widths, mirroring how :jumped and
+        # :shifted_* scale by half the band. Exactly 1.0 at the lower
+        # limit, growing linearly as the spread collapses, and bounded
+        # (1 + lcl/band_half) even at std = 0 — a ratio against std
+        # would explode toward 1e12 for a stuck sensor and poison the
+        # Board's max-concern aggregation across detectors.
         concern =
-          if std > ucl, do: std / max(ucl, 1.0e-12), else: lcl / max(std, 1.0e-12)
+          if std > ucl do
+            std / max(ucl, 1.0e-12)
+          else
+            band_half = (ucl - lcl) / 2.0
+            1.0 + (lcl - std) / max(band_half, 1.0e-12)
+          end
 
         [
           %{
