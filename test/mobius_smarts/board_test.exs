@@ -181,4 +181,19 @@ defmodule MobiusSmarts.BoardTest do
     assert %{learning: []} = Board.status(name)
     assert %{target: 1.0} = Board.baseline(name, {"m", %{}})
   end
+
+  test "status includes when it was last refreshed", %{name: name} do
+    assert %{updated_at: updated_at} = Board.status(name)
+    assert is_integer(updated_at)
+  end
+
+  test "reads on an instance that is not running raise a pointed error" do
+    message = ~r/no MobiusSmarts instance named :no_such_instance_xyz.*is it started\?/
+
+    assert_raise ArgumentError, message, fn -> Board.status(:no_such_instance_xyz) end
+    assert_raise ArgumentError, message, fn -> Board.findings(:no_such_instance_xyz) end
+    assert_raise ArgumentError, message, fn -> Board.observations(:no_such_instance_xyz) end
+    assert_raise ArgumentError, message, fn -> Board.baseline(:no_such_instance_xyz, @scope) end
+    assert_raise ArgumentError, message, fn -> Board.novelty(:no_such_instance_xyz) end
+  end
 end

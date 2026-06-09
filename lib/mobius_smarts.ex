@@ -149,6 +149,10 @@ defmodule MobiusSmarts do
   The instance's aggregate health: `%{level: :ok | :watch | :degraded
   | :critical, since: unix_seconds, concern: float, findings: [...],
   learning: [metric names still baselining], updated_at: ...}`.
+
+  Like every read (`status/1`, `findings/1`, `observations/3`,
+  `baseline/3`), raises `ArgumentError` when no instance with that
+  name is running — a dead monitor never reports healthy.
   """
   @spec status(atom()) :: map()
   def status(name \\ __MODULE__), do: Board.status(name)
