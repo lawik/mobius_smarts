@@ -11,7 +11,9 @@ defmodule MobiusSmarts.Detect.Drift do
   so that honest random noise drains as fast as it fills — the bucket
   hovers near empty forever. But a real drift, even a tiny one, fills
   slightly faster than the drain empties, so the level ratchets up
-  window after window and eventually overflows the alarm line (`h`).
+  window after window and eventually reaches the alarm line (`h`) —
+  the alarm fires the moment the level touches the line, not only
+  once it spills past.
   No single window tipped it off; the *accumulated* evidence did. A
   second bucket catches downward drifts the same way.
 
@@ -41,7 +43,7 @@ defmodule MobiusSmarts.Detect.Drift do
 
   - `:k` (drain rate, default `0.5`) — half the drift size you care
     about. `0.5` targets one-sigma drifts.
-  - `:h` (overflow line, default `5.0`) — trades false alarms against
+  - `:h` (alarm line, default `5.0`) — trades false alarms against
     detection delay. The in-control time-to-false-alarm grows
     *exponentially* in `h`; the defaults give an average run length of
     roughly 940 healthy windows per side (~470 for the two-sided
@@ -209,8 +211,8 @@ defmodule MobiusSmarts.Detect.Drift do
 
     status =
       cond do
-        upper > state.h -> :upper_alarm
-        lower > state.h -> :lower_alarm
+        upper >= state.h -> :upper_alarm
+        lower >= state.h -> :lower_alarm
         true -> :ok
       end
 
@@ -240,7 +242,7 @@ defmodule MobiusSmarts.Detect.Drift do
   end
 
   defp first_crossing(s, h) do
-    mask = Nx.greater(s, f64(h))
+    mask = Nx.greater_equal(s, f64(h))
 
     if Nx.to_number(Nx.any(mask)) == 1 do
       Nx.to_number(Nx.argmax(mask))
