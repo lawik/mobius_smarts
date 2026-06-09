@@ -115,6 +115,77 @@ defmodule MobiusSmarts.Detect.ShapeTest do
         Shape.from_sketches(a, b)
       end
     end
+
+    test "rejects an empty baseline sketch as missingness, not a shape" do
+      empty = DDSketch.new()
+      current = insert_all(DDSketch.new(), [5.0, 6.0, 7.0])
+
+      assert_raise ArgumentError, ~r/baseline sketch has no bins.*missingness/s, fn ->
+        Shape.from_sketches(empty, current)
+      end
+    end
+
+    test "rejects an empty current sketch as missingness, not a shape" do
+      baseline = insert_all(DDSketch.new(), [5.0, 6.0, 7.0])
+      empty = DDSketch.new()
+
+      assert_raise ArgumentError, ~r/current sketch has no bins.*missingness/s, fn ->
+        Shape.from_sketches(baseline, empty)
+      end
+    end
+
+    test "rejects two empty sketches" do
+      assert_raise ArgumentError, ~r/no bins.*recorded nothing/s, fn ->
+        Shape.from_sketches(DDSketch.new(), DDSketch.new())
+      end
+    end
+  end
+
+  describe "zero-mass count vectors" do
+    # An all-zero count vector has no distribution to compare; before
+    # the guard these returned NaN, which fails every threshold
+    # comparison silently and lets a real drift go unreported.
+    test "psi raises instead of returning NaN" do
+      assert_raise ArgumentError, ~r/expected counts sum to zero/, fn ->
+        Shape.psi([0, 0, 0], [1, 2, 3])
+      end
+
+      assert_raise ArgumentError, ~r/observed counts sum to zero/, fn ->
+        Shape.psi([1, 2, 3], [0, 0, 0])
+      end
+    end
+
+    test "js_divergence raises instead of returning NaN" do
+      assert_raise ArgumentError, ~r/p counts sum to zero/, fn ->
+        Shape.js_divergence([0, 0, 0], [1, 2, 3])
+      end
+
+      assert_raise ArgumentError, ~r/q counts sum to zero/, fn ->
+        Shape.js_divergence([1, 2, 3], [0, 0, 0])
+      end
+    end
+
+    test "moved_by raises instead of returning NaN" do
+      assert_raise ArgumentError, ~r/p counts sum to zero/, fn ->
+        Shape.moved_by([0, 0, 0], [1, 2, 3], [1.0, 2.0, 3.0])
+      end
+
+      assert_raise ArgumentError, ~r/q counts sum to zero/, fn ->
+        Shape.moved_by([1, 2, 3], [0, 0, 0], [1.0, 2.0, 3.0])
+      end
+    end
+
+    test "mean_shift raises instead of returning NaN" do
+      assert_raise ArgumentError, ~r/p counts sum to zero/, fn ->
+        Shape.mean_shift([0, 0, 0], [1, 2, 3], [1.0, 2.0, 3.0])
+      end
+    end
+
+    test "tensor inputs are guarded the same as lists" do
+      assert_raise ArgumentError, ~r/sum to zero/, fn ->
+        Shape.psi(Nx.tensor([0, 0, 0]), Nx.tensor([1, 2, 3]))
+      end
+    end
   end
 
   defp insert_all(sketch, values) do

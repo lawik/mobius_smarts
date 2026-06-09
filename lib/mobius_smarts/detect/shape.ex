@@ -69,6 +69,9 @@ defmodule MobiusSmarts.Detect.Shape do
   Rule-of-thumb thresholds from its long production history: `< 0.1`
   stable, `0.1..0.25` drifting, `> 0.25` shifted.
 
+  Raises `ArgumentError` when either count vector sums to zero — an
+  all-zero histogram is missingness, not a shape to compare.
+
   ## Examples
 
       iex> alias MobiusSmarts.Detect.Shape
@@ -83,8 +86,8 @@ defmodule MobiusSmarts.Detect.Shape do
   def psi(expected_counts, observed_counts, opts \\ []) do
     eps = Keyword.get(opts, :eps, @default_eps)
 
-    to_f64(expected_counts)
-    |> psi_kernel(to_f64(observed_counts), f64(eps))
+    nonzero_f64!(expected_counts, "expected")
+    |> psi_kernel(nonzero_f64!(observed_counts, "observed"), f64(eps))
     |> Nx.to_number()
   end
 
@@ -94,6 +97,9 @@ defmodule MobiusSmarts.Detect.Shape do
   Symmetric, bounded in `[0, ln 2 ≈ 0.693]`. `0` for identical
   distributions; `ln 2` for fully disjoint supports. Uses the
   `0 · ln 0 = 0` convention, so empty bins need no flooring.
+
+  Raises `ArgumentError` when either count vector sums to zero — an
+  all-zero histogram is missingness, not a shape to compare.
 
   ## Examples
 
@@ -108,8 +114,8 @@ defmodule MobiusSmarts.Detect.Shape do
   """
   @spec js_divergence(Nx.Tensor.t() | [number()], Nx.Tensor.t() | [number()]) :: float()
   def js_divergence(p_counts, q_counts) do
-    to_f64(p_counts)
-    |> jsd_kernel(to_f64(q_counts))
+    nonzero_f64!(p_counts, "p")
+    |> jsd_kernel(nonzero_f64!(q_counts, "q"))
     |> Nx.to_number()
   end
 
@@ -125,6 +131,9 @@ defmodule MobiusSmarts.Detect.Shape do
 
       W1 = sum(|CDF_p(i) - CDF_q(i)| * (v[i+1] - v[i]))
 
+  Raises `ArgumentError` when either count vector sums to zero — an
+  all-zero histogram is missingness, not a shape to compare.
+
   ## Examples
 
       iex> alias MobiusSmarts.Detect.Shape
@@ -138,8 +147,8 @@ defmodule MobiusSmarts.Detect.Shape do
           Nx.Tensor.t() | [number()]
         ) :: float()
   def moved_by(p_counts, q_counts, bin_values) do
-    to_f64(p_counts)
-    |> emd_kernel(to_f64(q_counts), to_f64(bin_values))
+    nonzero_f64!(p_counts, "p")
+    |> emd_kernel(nonzero_f64!(q_counts, "q"), to_f64(bin_values))
     |> Nx.to_number()
   end
 
@@ -147,6 +156,9 @@ defmodule MobiusSmarts.Detect.Shape do
   Signed companion to `moved_by/3`: the difference of distribution
   means, `mean(current) - mean(baseline)`, in the metric's own units.
   Positive means the distribution moved up/right.
+
+  Raises `ArgumentError` when either count vector sums to zero — an
+  all-zero histogram is missingness, not a shape to compare.
 
   ## Examples
 
@@ -160,8 +172,8 @@ defmodule MobiusSmarts.Detect.Shape do
           Nx.Tensor.t() | [number()]
         ) :: float()
   def mean_shift(p_counts, q_counts, bin_values) do
-    to_f64(p_counts)
-    |> mean_shift_kernel(to_f64(q_counts), to_f64(bin_values))
+    nonzero_f64!(p_counts, "p")
+    |> mean_shift_kernel(nonzero_f64!(q_counts, "q"), to_f64(bin_values))
     |> Nx.to_number()
   end
 
@@ -175,7 +187,10 @@ defmodule MobiusSmarts.Detect.Shape do
   bucket maps to `0.0` and negative bins mirror to negative values.
 
   Both sketches must share the same `relative_accuracy` (and therefore
-  bin layout); raises `ArgumentError` otherwise.
+  bin layout); raises `ArgumentError` otherwise. Also raises
+  `ArgumentError` when either sketch has no bins — an empty sketch
+  means the metric recorded nothing in that window, which is
+  missingness, not a shape to compare.
   """
   @spec from_sketches(DDSketch.t(), DDSketch.t()) :: %{
           baseline: Nx.Tensor.t(),
@@ -190,8 +205,8 @@ defmodule MobiusSmarts.Detect.Shape do
               "their bins are not alignable"
     end
 
-    base_map = baseline |> DDSketch.bin_estimates() |> Map.new()
-    curr_map = current |> DDSketch.bin_estimates() |> Map.new()
+    base_map = baseline |> DDSketch.bin_estimates() |> Map.new() |> ensure_bins!("baseline")
+    curr_map = current |> DDSketch.bin_estimates() |> Map.new() |> ensure_bins!("current")
 
     values =
       base_map
@@ -249,6 +264,32 @@ defmodule MobiusSmarts.Detect.Shape do
 
   defp to_f64(values) when is_list(values), do: Nx.tensor(values, type: :f64)
   defp to_f64(values), do: Nx.as_type(values, :f64)
+
+  # A count vector with no mass has no distribution: dividing by its
+  # zero sum yields NaN, and NaN fails every threshold comparison
+  # *silently* — a real drift would go unreported. Raise instead so
+  # missingness is loud.
+  defp nonzero_f64!(counts, name) do
+    tensor = to_f64(counts)
+
+    if Nx.to_number(Nx.sum(tensor)) == 0.0 do
+      raise ArgumentError,
+            "#{name} counts sum to zero — an all-zero histogram means the " <>
+              "metric recorded nothing in that window; treat it as " <>
+              "missingness, not as a shape to compare"
+    end
+
+    tensor
+  end
+
+  defp ensure_bins!(bin_map, which) when map_size(bin_map) == 0 do
+    raise ArgumentError,
+          "#{which} sketch has no bins — an empty sketch means the metric " <>
+            "recorded nothing in that window; treat it as missingness, " <>
+            "not as a shape to compare"
+  end
+
+  defp ensure_bins!(bin_map, _which), do: bin_map
 
   defp f64(scalar), do: Nx.tensor(scalar * 1.0, type: :f64)
 end
