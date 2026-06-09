@@ -20,5 +20,14 @@ erl_crash.dump
 *.ez
 
 # Ignore package tarball (built via "mix hex.build").
-mobius_processing-*.tar
+mobius_smarts-*.tar
+
+# macOS Finder metadata.
+.DS_Store
+
+# Local review/scratch notes — not part of the published library.
+/CRITIQUE.md
+/FRIENDLY.md
+/QUALITY.md
+/critique_probe.exs
 

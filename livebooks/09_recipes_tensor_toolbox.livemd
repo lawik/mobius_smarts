@@ -1,0 +1,636 @@
+# Tensor recipes — a toolbox tour
+
+```elixir
+Mix.install([
+  {:mobius_smarts, path: Path.expand("..", __DIR__)},
+  {:kino, "~> 0.14"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+```
+
+```elixir
+alias VegaLite, as: Vl
+alias MobiusSmarts.Recipes.{CoreNx, DefnKernels}
+```
+
+This is a quick tour of the recipe functions in `MobiusSmarts.Recipes`. Each
+one answers a single question about a stream of device metrics. We synthesize a
+small series, draw the one picture that makes the trick obvious, and call the
+library function. The deeper theory behind these tricks lives in notebooks 01–08
+— here we just want to know what each tool is *for*.
+
+A few terms get used along the way, explained in plain language the first time
+they show up.
+
+## 1. Did the CPU run hot?
+
+A device can spend almost all its time cool and still cook itself during a brief
+spike. The **mean** (the plain average of all the samples) smooths that spike
+away to nothing. `CoreNx.ran_hot?/2` instead slides a window across the series
+and takes the **window-max** (the largest value inside each window), so a short
+peak still trips the alarm.
+
+We build a temperature series that sits around 55°C with a single 3-sample spike
+up to 82°C, and a threshold input you can drag.
+
+```elixir
+threshold_input = Kino.Input.range("Hot threshold (°C)", min: 60, max: 90, default: 75, step: 1)
+```
+
+```elixir
+:rand.seed(:exsss, {1, 2, 3})
+
+n = 120
+calm = for _ <- 1..n, do: 55.0 + (:rand.uniform() - 0.5) * 4.0
+
+# Spiky series: same calm baseline, but samples 60–62 spike to ~82°C.
+spiky =
+  calm
+  |> Enum.with_index()
+  |> Enum.map(fn {v, i} -> if i in 60..62, do: 82.0, else: v end)
+
+threshold = Kino.Input.read(threshold_input) * 1.0
+
+spiky_t = Nx.tensor(spiky)
+calm_t = Nx.tensor(calm)
+
+mean_line = spiky_t |> Nx.mean() |> Nx.to_number()
+
+rows =
+  spiky
+  |> Enum.with_index()
+  |> Enum.map(fn {v, i} -> %{"sample" => i, "temp" => v} end)
+
+series =
+  Vl.new(width: 700, height: 250, title: "CPU temperature — one short spike")
+  |> Vl.data_from_values(rows)
+  |> Vl.mark(:line, point: false)
+  |> Vl.encode_field(:x, "sample", type: :quantitative)
+  |> Vl.encode_field(:y, "temp", type: :quantitative, scale: [domain: [50, 90]])
+
+threshold_rule =
+  Vl.new()
+  |> Vl.data_from_values([%{"y" => threshold}])
+  |> Vl.mark(:rule, color: "red", stroke_dash: [6, 4])
+  |> Vl.encode_field(:y, "y", type: :quantitative)
+
+mean_rule =
+  Vl.new()
+  |> Vl.data_from_values([%{"y" => mean_line}])
+  |> Vl.mark(:rule, color: "gray")
+  |> Vl.encode_field(:y, "y", type: :quantitative)
+
+Vl.new(width: 700, height: 250)
+|> Vl.layers([series, threshold_rule, mean_rule])
+```
+
+The gray line is the mean — it sits far below the red threshold, so a
+mean-based check would say "all good". The window-max sees the spike:
+
+```elixir
+mean_says = mean_line > threshold
+
+hot_spiky = CoreNx.ran_hot?(spiky_t, window: 10, threshold: threshold)
+hot_calm = CoreNx.ran_hot?(calm_t, window: 10, threshold: threshold)
+
+Kino.DataTable.new([
+  %{"check" => "plain mean over threshold?", "result" => mean_says},
+  %{"check" => "ran_hot? (spiky series)", "result" => hot_spiky},
+  %{"check" => "ran_hot? (calm series)", "result" => hot_calm}
+])
+```
+
+The mean misses the spike; `ran_hot?` catches it on the spiky series and stays
+quiet on the calm one.
+
+## 2. Is memory leaking / when does the disk fill?
+
+Memory pressure rarely jumps — it creeps. To measure a creep we fit a straight
+line through the points. **Least squares** is just "the line that minimizes the
+total squared miss between the line and the actual points". Its slope tells us
+how fast the metric is trending.
+
+`CoreNx.mem_slope_per_day/1` returns that slope scaled to percentage-points of
+RAM gained per day (assuming 1Hz samples). `CoreNx.disk_days_to_threshold/2`
+uses the same fit to project when a disk-usage series will cross a limit.
+
+```elixir
+:rand.seed(:exsss, {4, 5, 6})
+
+dn = 100
+# Disk usage climbing ~0.30%/sample from 50%, with a little noise.
+disk = for i <- 0..(dn - 1), do: 50.0 + 0.30 * i + (:rand.uniform() - 0.5) * 1.5
+disk_t = Nx.tensor(disk)
+
+disk_threshold = 95.0
+days_left = CoreNx.disk_days_to_threshold(disk_t, disk_threshold)
+slope_per_day = CoreNx.mem_slope_per_day(disk_t)
+
+# Fit line for drawing: recover a + b·t from endpoints of the projection.
+current = List.last(disk)
+b = (disk_threshold - current) / days_left
+a = current - b * (dn - 1)
+
+cross_x = dn - 1 + days_left
+
+fit_rows = [
+  %{"sample" => 0, "fit" => a},
+  %{"sample" => cross_x, "fit" => a + b * cross_x}
+]
+
+disk_rows =
+  disk
+  |> Enum.with_index()
+  |> Enum.map(fn {v, i} -> %{"sample" => i, "disk" => v} end)
+
+raw =
+  Vl.new()
+  |> Vl.data_from_values(disk_rows)
+  |> Vl.mark(:point, color: "steelblue", opacity: 0.6)
+  |> Vl.encode_field(:x, "sample", type: :quantitative)
+  |> Vl.encode_field(:y, "disk", type: :quantitative, scale: [domain: [45, 100]])
+
+fit =
+  Vl.new()
+  |> Vl.data_from_values(fit_rows)
+  |> Vl.mark(:line, color: "orange")
+  |> Vl.encode_field(:x, "sample", type: :quantitative)
+  |> Vl.encode_field(:y, "fit", type: :quantitative)
+
+limit =
+  Vl.new()
+  |> Vl.data_from_values([%{"y" => disk_threshold}])
+  |> Vl.mark(:rule, color: "red", stroke_dash: [6, 4])
+  |> Vl.encode_field(:y, "y", type: :quantitative)
+
+Vl.new(width: 700, height: 280, title: "Disk usage with least-squares fit projected to the limit")
+|> Vl.layers([raw, fit, limit])
+```
+
+```elixir
+Kino.DataTable.new([
+  %{"metric" => "slope (pts/day, 1Hz)", "value" => Float.round(slope_per_day, 0)},
+  %{"metric" => "samples until 95%", "value" => Float.round(days_left, 1)}
+])
+```
+
+The orange line is the least-squares fit; the disk crosses the red limit roughly
+where it meets it. One caveat: least squares is pulled around by outliers, so a
+single bad spike can tilt the slope. For a spike-robust slope, see the Theil–Sen
+notebook (04).
+
+## 3. Counter → rate
+
+Many metrics are **counters**: numbers that only ever climb (total bytes sent,
+total packets). The interesting quantity is the *rate* — how much it grows per
+sample. We get that by **first-differencing** (subtracting each sample from the
+next). The catch: when an interface restarts, the counter resets to zero, which
+produces a big negative difference. `CoreNx.mean_rate/1` masks those negatives
+out before averaging.
+
+```elixir
+:rand.seed(:exsss, {7, 8, 9})
+
+# A byte counter climbing ~1000/sample, then a hard reset at sample 30.
+pre = for i <- 0..29, do: 100_000 + 1000 * i + :rand.uniform(200)
+post = for i <- 0..19, do: 500 + 1000 * i + :rand.uniform(200)
+counter = pre ++ post
+counter_t = Nx.tensor(counter, type: :s64)
+
+counter_rows =
+  counter
+  |> Enum.with_index()
+  |> Enum.map(fn {v, i} -> %{"sample" => i, "counter" => v} end)
+
+Vl.new(width: 700, height: 220, title: "Byte counter — note the cliff at the interface restart")
+|> Vl.data_from_values(counter_rows)
+|> Vl.mark(:line, point: false, color: "steelblue")
+|> Vl.encode_field(:x, "sample", type: :quantitative)
+|> Vl.encode_field(:y, "counter", type: :quantitative)
+```
+
+Now the first differences. The one giant negative bar is the reset — masking it
+out is the whole trick:
+
+```elixir
+diffs = counter_t |> Nx.diff() |> Nx.to_flat_list()
+
+diff_rows =
+  diffs
+  |> Enum.with_index()
+  |> Enum.map(fn {d, i} ->
+    %{"sample" => i, "diff" => d, "kind" => if(d < 0, do: "reset (masked)", else: "normal")}
+  end)
+
+masked_chart =
+  Vl.new(width: 700, height: 220, title: "First differences — the reset is the lone negative bar")
+  |> Vl.data_from_values(diff_rows)
+  |> Vl.mark(:bar)
+  |> Vl.encode_field(:x, "sample", type: :quantitative)
+  |> Vl.encode_field(:y, "diff", type: :quantitative)
+  |> Vl.encode_field(:color, "kind",
+    type: :nominal,
+    scale: [domain: ["normal", "reset (masked)"], range: ["steelblue", "red"]]
+  )
+
+masked_chart
+```
+
+```elixir
+# Naive mean: average every diff, including the negative reset.
+naive_rate = Enum.sum(diffs) / length(diffs)
+
+# Library: masks negatives before averaging.
+clean_rate = CoreNx.mean_rate(counter_t)
+
+Kino.DataTable.new([
+  %{"method" => "naive mean of all diffs", "rate/sample" => Float.round(naive_rate, 1)},
+  %{"method" => "mean_rate (reset masked)", "rate/sample" => Float.round(clean_rate, 1)}
+])
+```
+
+The naive mean is dragged way down by the one huge negative diff — it can even go
+negative or absurd, which is nonsense for a byte counter. `mean_rate` masks the
+reset and lands on the true ~1000/sample.
+
+## 4. What does the distribution look like?
+
+A **histogram** counts how many samples fall into each value range ("bin"). It
+tells you the *shape* of the data, not just one summary number. A **quantile**
+is the value below which a given fraction of samples sit — the p50 (median) is
+the middle value, p95 is the value 95% of samples come in under.
+
+`CoreNx.value_histogram/4` bins values: you pick a low bound, a bin width, and a
+number of bins. Anything below the low bound lands in bin 0; anything above the
+top lands in the last bin (it's clamped into the edges). `CoreNx.quantile/2`
+gives the quantile.
+
+```elixir
+:rand.seed(:exsss, {10, 11, 12})
+
+# Latency-ish gauge: mostly low, with a long right tail.
+latency =
+  for _ <- 1..600 do
+    base = 20.0 + :rand.uniform() * 30.0
+    if :rand.uniform() < 0.1, do: base + :rand.uniform() * 120.0, else: base
+  end
+
+latency_t = Nx.tensor(latency)
+
+lo = 0.0
+width = 20.0
+n_bins = 12
+hist = CoreNx.value_histogram(latency_t, lo, width, n_bins) |> Nx.to_flat_list()
+
+p50 = CoreNx.quantile(latency_t, 0.5)
+p95 = CoreNx.quantile(latency_t, 0.95)
+
+hist_rows =
+  hist
+  |> Enum.with_index()
+  |> Enum.map(fn {count, i} ->
+    %{"bin_lo" => lo + i * width, "count" => count}
+  end)
+
+bars =
+  Vl.new()
+  |> Vl.data_from_values(hist_rows)
+  |> Vl.mark(:bar, color: "steelblue")
+  |> Vl.encode_field(:x, "bin_lo", type: :ordinal, title: "latency bin (ms, lower edge)")
+  |> Vl.encode_field(:y, "count", type: :quantitative)
+
+p50_rule =
+  Vl.new()
+  |> Vl.data_from_values([%{"x" => p50}])
+  |> Vl.mark(:rule, color: "green")
+  |> Vl.encode_field(:x, "x", type: :quantitative)
+
+p95_rule =
+  Vl.new()
+  |> Vl.data_from_values([%{"x" => p95}])
+  |> Vl.mark(:rule, color: "red")
+  |> Vl.encode_field(:x, "x", type: :quantitative)
+
+dist =
+  Vl.new(width: 700, height: 280, title: "Latency distribution with p50 (green) and p95 (red)")
+  |> Vl.layers([bars, p50_rule, p95_rule])
+
+Kino.Layout.grid(
+  [
+    dist,
+    Kino.DataTable.new([
+      %{"quantile" => "p50 (median)", "ms" => Float.round(p50, 1)},
+      %{"quantile" => "p95", "ms" => Float.round(p95, 1)}
+    ])
+  ],
+  columns: 1
+)
+```
+
+Most requests are fast; the long right tail is why p95 sits well above the
+median. (The p50/p95 rules use the raw value axis, so they line up by value with
+the lower edge of each bar.)
+
+## 5. Is the latest sample anomalous?
+
+The **standard deviation** (std dev, written σ) measures the typical spread of a
+series — how far samples usually stray from the average. A **z-score** says how
+many of those typical-noise-widths a new point sits from the window's average.
+`CoreNx.z_score/2` computes it; `CoreNx.anomalous?/3` turns it into a boolean
+(true when the absolute z-score exceeds k, default 3).
+
+```elixir
+:rand.seed(:exsss, {13, 14, 15})
+
+window = for _ <- 1..60, do: 50.0 + (:rand.uniform() - 0.5) * 4.0
+window_t = Nx.tensor(window)
+
+new_point = 64.0
+
+mu = window_t |> Nx.mean() |> Nx.to_number()
+sigma = window_t |> Nx.standard_deviation() |> Nx.to_number()
+
+z = CoreNx.z_score(window_t, new_point)
+is_anom = CoreNx.anomalous?(window_t, new_point)
+
+win_rows =
+  window
+  |> Enum.with_index()
+  |> Enum.map(fn {v, i} -> %{"sample" => i, "value" => v} end)
+
+pts =
+  Vl.new()
+  |> Vl.data_from_values(win_rows)
+  |> Vl.mark(:point, color: "steelblue", opacity: 0.6)
+  |> Vl.encode_field(:x, "sample", type: :quantitative)
+  |> Vl.encode_field(:y, "value", type: :quantitative, scale: [domain: [40, 70]])
+
+new_pt =
+  Vl.new()
+  |> Vl.data_from_values([%{"sample" => length(window), "value" => new_point}])
+  |> Vl.mark(:point, color: "red", size: 120, filled: true)
+  |> Vl.encode_field(:x, "sample", type: :quantitative)
+  |> Vl.encode_field(:y, "value", type: :quantitative)
+
+band =
+  Vl.new()
+  |> Vl.data_from_values([%{"lo" => mu - 3 * sigma, "hi" => mu + 3 * sigma}])
+  |> Vl.mark(:rect, opacity: 0.12, color: "green")
+  |> Vl.encode_field(:y, "lo", type: :quantitative)
+  |> Vl.encode_field(:y2, "hi")
+
+anom =
+  Vl.new(width: 700, height: 280, title: "Window + new point (red) inside the ±3σ band")
+  |> Vl.layers([band, pts, new_pt])
+
+anom
+```
+
+```elixir
+Kino.DataTable.new([
+  %{"metric" => "z-score of new point", "value" => Float.round(z, 2)},
+  %{"metric" => "anomalous? (|z| > 3)", "value" => is_anom}
+])
+```
+
+The red point sits outside the green band, so its z-score is past 3 and
+`anomalous?` returns true. This is the quick version; the principled
+per-window control-chart treatment is the Shewhart notebook (01).
+
+## 6. Smoothed at several timescales
+
+The familiar 1-/5-/15-minute "load average" is just the same signal averaged
+over several window widths at once. `CoreNx.rolling_means/2` does this for any
+gauge: pass a list of window sizes, get back a map from size to the smoothed
+tensor.
+
+One thing to watch: `Nx.window_mean` is valid-only, so a window of size `w`
+produces `length - w + 1` outputs. Align the x-axis by shifting each smoothed
+series to start at sample `w - 1`.
+
+```elixir
+:rand.seed(:exsss, {16, 17, 18})
+
+# A noisy gauge with a slow rise and fall underneath.
+gn = 200
+
+gauge =
+  for i <- 0..(gn - 1) do
+    trend = 30.0 + 20.0 * :math.sin(i / 40.0)
+    trend + (:rand.uniform() - 0.5) * 12.0
+  end
+
+gauge_t = Nx.tensor(gauge)
+rolled = CoreNx.rolling_means(gauge_t, [5, 20, 50])
+
+raw_rows =
+  gauge
+  |> Enum.with_index()
+  |> Enum.map(fn {v, i} -> %{"sample" => i, "value" => v, "kind" => "raw"} end)
+
+rolled_rows =
+  for size <- [5, 20, 50],
+      {v, j} <- rolled[size] |> Nx.to_flat_list() |> Enum.with_index() do
+    %{"sample" => j + size - 1, "value" => v, "kind" => "window #{size}"}
+  end
+
+Vl.new(width: 700, height: 300, title: "Raw gauge with rolling means at 3 timescales")
+|> Vl.data_from_values(raw_rows ++ rolled_rows)
+|> Vl.mark(:line)
+|> Vl.encode_field(:x, "sample", type: :quantitative)
+|> Vl.encode_field(:y, "value", type: :quantitative)
+|> Vl.encode_field(:color, "kind",
+  type: :nominal,
+  scale: [
+    domain: ["raw", "window 5", "window 20", "window 50"],
+    range: ["#cccccc", "#1f77b4", "#ff7f0e", "#2ca02c"]
+  ]
+)
+```
+
+The wider the window, the smoother (and laggier) the line. The big window
+follows the underlying trend; the small one still wiggles with the noise.
+
+## 7. Null-aware mean
+
+Real metric streams have gaps. If you fill the missing slots with zeros and take
+a plain mean, those zeros drag the answer down. `CoreNx.mean_with_validity/2`
+takes a **validity mask** — a `1` for present, `0` for missing — and averages
+only the present values.
+
+```elixir
+values = Nx.tensor([42.0, 0.0, 45.0, 0.0, 0.0, 48.0, 44.0])
+validity = Nx.tensor([1, 0, 1, 0, 0, 1, 1], type: :u8)
+
+naive_with_zeros = values |> Nx.mean() |> Nx.to_number()
+correct = CoreNx.mean_with_validity(values, validity)
+
+Kino.DataTable.new([
+  %{"method" => "plain mean (zeros count as data)", "value" => Float.round(naive_with_zeros, 2)},
+  %{"method" => "mean_with_validity (gaps ignored)", "value" => Float.round(correct, 2)}
+])
+```
+
+The zeros-for-missing mean is far too low; the validity-aware mean averages only
+the four real readings.
+
+## 8. Binary state signals
+
+Many device signals are just on/off: a pump, a relay, the wifi-connected flag.
+Stored as a `0`/`1` series, three numbers describe its behavior:
+`DefnKernels.transition_count/1` counts every edge (each on and each off);
+dividing by two gives the number of complete on-off **episodes**.
+`DefnKernels.seconds_on/2` multiplies the count of `1`s by the sample interval.
+And `Nx.mean` of the series is the **duty cycle** — the fraction of time it was on.
+
+```elixir
+:rand.seed(:exsss, {19, 20, 21})
+
+# A pump that switches on in a few bursts across 80 samples.
+pump =
+  for i <- 0..79 do
+    cond do
+      i in 8..15 -> 1
+      i in 30..45 -> 1
+      i in 60..63 -> 1
+      true -> 0
+    end
+  end
+
+pump_t = Nx.tensor(pump, type: :u8)
+dt = 2.0
+
+transitions = DefnKernels.transition_count(pump_t) |> Nx.to_number()
+episodes = div(transitions, 2)
+secs_on = DefnKernels.seconds_on(pump_t, dt) |> Nx.to_number()
+duty = pump_t |> Nx.mean() |> Nx.to_number()
+
+pump_rows =
+  pump
+  |> Enum.with_index()
+  |> Enum.map(fn {v, i} -> %{"sample" => i, "on" => v} end)
+
+state_chart =
+  Vl.new(width: 700, height: 160, title: "Pump on/off state")
+  |> Vl.data_from_values(pump_rows)
+  |> Vl.mark(:area, interpolate: "step-after", color: "steelblue", opacity: 0.7)
+  |> Vl.encode_field(:x, "sample", type: :quantitative)
+  |> Vl.encode_field(:y, "on", type: :quantitative, scale: [domain: [0, 1]])
+
+state_chart
+```
+
+```elixir
+Kino.DataTable.new([
+  %{"metric" => "transitions (edges)", "value" => transitions},
+  %{"metric" => "episodes (transitions / 2)", "value" => episodes},
+  %{"metric" => "seconds on (dt = #{dt}s)", "value" => secs_on},
+  %{"metric" => "duty cycle", "value" => Float.round(duty, 3)}
+])
+```
+
+Three on-bursts give six edges, so three episodes; the duty cycle says the pump
+ran about a third of the time.
+
+## 9. Run structure
+
+To ask "how long was the longest continuous run?", we need to label each sample
+with which run it belongs to. `DefnKernels.run_ids/1` does exactly that — it
+numbers the runs. `DefnKernels.run_lengths/2` then tallies the length of each
+on-run. Bucket `0` collects all the off-samples and is usually ignored.
+
+```elixir
+run_id_t = DefnKernels.run_ids(pump_t)
+run_id_list = Nx.to_flat_list(run_id_t)
+
+id_rows =
+  Enum.zip([pump, run_id_list, 0..79])
+  |> Enum.map(fn {on, id, i} ->
+    %{"sample" => i, "run_id" => if(on == 1, do: id, else: 0), "on" => on}
+  end)
+
+colored =
+  Vl.new(width: 700, height: 120, title: "Same series colored by run id (off = run 0)")
+  |> Vl.data_from_values(id_rows)
+  |> Vl.mark(:rect)
+  |> Vl.encode_field(:x, "sample", type: :ordinal, axis: [labels: false, ticks: false])
+  |> Vl.encode_field(:color, "run_id", type: :ordinal, scale: [scheme: "category10"])
+
+colored
+```
+
+```elixir
+# We know there are 3 on-runs, so max_runs = 3 is enough headroom.
+lengths = DefnKernels.run_lengths(pump_t, 3) |> Nx.to_flat_list()
+
+# Drop bucket 0 (the off-samples); buckets 1.. are the on-runs.
+on_run_rows =
+  lengths
+  |> Enum.with_index()
+  |> Enum.drop(1)
+  |> Enum.map(fn {len, id} -> %{"run" => "run #{id}", "length" => len} end)
+
+longest = on_run_rows |> Enum.map(& &1["length"]) |> Enum.max()
+
+bars =
+  Vl.new(width: 400, height: 240, title: "On-run lengths (samples)")
+  |> Vl.data_from_values(on_run_rows)
+  |> Vl.mark(:bar, color: "steelblue")
+  |> Vl.encode_field(:x, "run", type: :nominal)
+  |> Vl.encode_field(:y, "length", type: :quantitative)
+
+bars
+```
+
+```elixir
+Kino.DataTable.new([
+  %{"metric" => "longest continuous on-run (samples)", "value" => longest}
+])
+```
+
+The pump's longest continuous run was 16 samples — the middle burst.
+
+## 10. When during the day do events happen?
+
+Given a stream of event timestamps (UNIX seconds), `DefnKernels.events_per_hour/1`
+returns a `{24}` count tensor: bucket `h` is how many events fell in hour `h` of
+the day. Good for spotting "all our reconnects happen at night".
+
+```elixir
+:rand.seed(:exsss, {22, 23, 24})
+
+day0 = 1_700_000_000 - rem(1_700_000_000, 86_400)
+
+# Reconnect events clustered in the small hours (1–3am), a few scattered by day.
+night_events =
+  for _ <- 1..120 do
+    hour = Enum.random([1, 1, 2, 2, 2, 3])
+    day = Enum.random(0..6)
+    day0 + day * 86_400 + hour * 3600 + :rand.uniform(3600) - 1
+  end
+
+day_events =
+  for _ <- 1..30 do
+    hour = Enum.random(8..20)
+    day = Enum.random(0..6)
+    day0 + day * 86_400 + hour * 3600 + :rand.uniform(3600) - 1
+  end
+
+ts = Nx.tensor(night_events ++ day_events, type: :s64)
+per_hour = DefnKernels.events_per_hour(ts) |> Nx.to_flat_list()
+
+hour_rows =
+  per_hour
+  |> Enum.with_index()
+  |> Enum.map(fn {count, h} -> %{"hour" => h, "count" => count} end)
+
+Vl.new(width: 700, height: 280, title: "Events by hour of day — reconnects cluster at night")
+|> Vl.data_from_values(hour_rows)
+|> Vl.mark(:bar, color: "steelblue")
+|> Vl.encode_field(:x, "hour", type: :ordinal)
+|> Vl.encode_field(:y, "count", type: :quantitative)
+```
+
+The tall bars at 1–3am are the nightly reconnect storm; the daytime hours are a
+flat scatter. That is the whole toolbox — ten one-question tools you can point at
+any device metric.

@@ -1,0 +1,587 @@
+# Outlier detection — Isolation Forest
+
+```elixir
+Mix.install([
+  {:mobius_smarts, path: Path.expand("..", __DIR__)},
+  {:kino, "~> 0.14"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+```
+
+## The question
+
+Every other detector in this stack answers a question you could almost
+write a rule for: *did it jump?*, *is it drifting?*, *did the shape
+change?* This one answers the uncomfortable one: **is this window weird
+in some way nobody wrote a rule for?**
+
+And "weird" here is not weird for *this* device — it's weird against
+what the whole *fleet's* data says normal looks like. A device that has
+only ever seen its own quiet corner of behaviour can still be told "the
+combination of numbers you just produced is one almost no healthy
+device in the fleet produces."
+
+The division of labour matters, so let's be blunt about it up front:
+
+* **`MobiusSmarts.Detect.Outlier` is inference only.** It loads a
+  trained forest and scores vectors. It does not train.
+* **Training happens fleet-side**, off the device — for example a
+  `sklearn.ensemble.IsolationForest` fitted over per-device feature
+  vectors pulled from your warehouse. The fitted forest is exported to
+  a small JSON shape and shipped down to each device.
+
+In this notebook we will train a *tiny* forest in plain Elixir, purely
+so we have something concrete to play with. That trainer is not part of
+the library and is not meant for production — but the forest it
+produces takes the **exact same JSON path** a real fleet model takes:
+export to JSON, ship, `load!`, `score`.
+
+```elixir
+alias VegaLite, as: Vl
+alias MobiusSmarts.Detect.Outlier
+alias MobiusSmarts.Detect.Novelty
+```
+
+## Few and different, seen on a chart
+
+The whole idea rests on one observation: **outliers are few and
+different.** Because they are few and sit apart from the crowd, a
+*random* cut through the data — pick an axis, pick a place on it, slice
+— tends to corner an outlier almost immediately. It ends up alone in
+its own little region after only a cut or two. A normal point buried in
+the dense crowd survives many cuts before it finally sits alone.
+
+Let's make a 2D dataset to look at: a dense blob of normal
+`(cpu, latency)` points plus three obvious outliers off on their own.
+
+```elixir
+:rand.seed(:exsss, {1, 2, 3})
+
+normal_pts =
+  for _ <- 1..200 do
+    [40.0 + :rand.normal() * 6.0, 100.0 + :rand.normal() * 12.0]
+  end
+
+outlier_pts = [[85.0, 95.0], [38.0, 200.0], [80.0, 190.0]]
+
+blob_rows = for [x, y] <- normal_pts, do: %{cpu: x, latency: y, kind: "normal"}
+out_rows = for [x, y] <- outlier_pts, do: %{cpu: x, latency: y, kind: "outlier"}
+all_rows = blob_rows ++ out_rows
+length(all_rows)
+```
+
+Now watch a handful of cuts. These cuts are **hand-picked for
+illustration** (real cuts are random — that comes next); they are
+chosen to show an outlier getting cornered fast. Each rule is one cut.
+After cut 1 (a vertical line at cpu = 62) the lone high-cpu point on
+the right is *already* alone — one cut isolated it. The blob, meanwhile,
+is still one uncut crowd. The horizontal line at latency = 150 corners
+the two high-latency outliers together; one more cut would split them.
+
+```elixir
+cuts = [
+  %{orient: "x", at: 62.0, label: "cut 1: cpu <= 62"},
+  %{orient: "y", at: 150.0, label: "cut 2: latency <= 150"},
+  %{orient: "x", at: 60.0, label: "cut 3: cpu <= 60"}
+]
+
+vrules =
+  Vl.new()
+  |> Vl.data_from_values(Enum.filter(cuts, &(&1.orient == "x")))
+  |> Vl.mark(:rule, color: "firebrick", strokeDash: [6, 4])
+  |> Vl.encode_field(:x, "at", type: :quantitative)
+
+hrules =
+  Vl.new()
+  |> Vl.data_from_values(Enum.filter(cuts, &(&1.orient == "y")))
+  |> Vl.mark(:rule, color: "firebrick", strokeDash: [6, 4])
+  |> Vl.encode_field(:y, "at", type: :quantitative)
+
+points =
+  Vl.new()
+  |> Vl.data_from_values(all_rows)
+  |> Vl.mark(:circle, size: 60, opacity: 0.7)
+  |> Vl.encode_field(:x, "cpu", type: :quantitative, scale: [domain: [20, 95]])
+  |> Vl.encode_field(:y, "latency", type: :quantitative, scale: [domain: [60, 215]])
+  |> Vl.encode_field(:color, "kind", type: :nominal)
+
+Vl.new(width: 700, height: 420, title: "A few random cuts corner the outliers fast")
+|> Vl.layers([points, vrules, hrules])
+```
+
+Look at the red outliers: each sits alone in a region after just one or
+two cuts. The orange blob is still a single undivided crowd. That gap —
+*cornered in 2 cuts vs. needs dozens* — is the entire signal an
+isolation forest measures.
+
+## Build the trainer
+
+A tree is grown by repeatedly making that random cut: pick a random
+feature, pick a random threshold somewhere between that feature's min
+and max **among the points currently in this node**, send points with
+`x[feature] <= threshold` left and the rest right, and recurse. Stop
+when a node holds one point or fewer, or when we hit a depth cap. The
+depth cap is `ceil(log2(psi))` — the depth where a *balanced* tree over
+`psi` points would bottom out, so we don't waste effort splitting the
+crowd forever.
+
+We record at every node how many training points reached it (its
+`size`). That count is what lets scoring later "charge" a leaf for the
+cuts it skipped.
+
+The code below is about 30 lines and **is the lesson** — read it.
+
+```elixir
+defmodule TinyForest do
+  # Grow one tree. Returns a flat list of node maps in pre-order;
+  # we renumber into columnar arrays at export time.
+  def grow_tree(points, depth_cap) do
+    {nodes, _next} = build(points, 0, depth_cap, 0)
+    nodes
+  end
+
+  defp build(points, depth, depth_cap, id) do
+    n = length(points)
+
+    if n <= 1 or depth >= depth_cap do
+      {[%{id: id, feature: -1, threshold: 0.0, left: -1, right: -1, size: n}], id + 1}
+    else
+      feature = :rand.uniform(2) - 1
+      vals = Enum.map(points, &Enum.at(&1, feature))
+      {lo, hi} = Enum.min_max(vals)
+
+      if lo == hi do
+        # No spread on this feature here — make it a leaf.
+        {[%{id: id, feature: -1, threshold: 0.0, left: -1, right: -1, size: n}], id + 1}
+      else
+        threshold = lo + :rand.uniform() * (hi - lo)
+        {left_pts, right_pts} = Enum.split_with(points, &(Enum.at(&1, feature) <= threshold))
+
+        # Reserve id for this node, then lay out the left subtree, then right.
+        {left_nodes, after_left} = build(left_pts, depth + 1, depth_cap, id + 1)
+        {right_nodes, after_right} = build(right_pts, depth + 1, depth_cap, after_left)
+
+        node = %{
+          id: id,
+          feature: feature,
+          threshold: threshold,
+          left: id + 1,
+          right: after_left,
+          size: n
+        }
+
+        {[node | left_nodes ++ right_nodes], after_right}
+      end
+    end
+  end
+
+  def grow_forest(points, n_trees, psi) do
+    depth_cap = :math.log2(psi) |> :math.ceil() |> trunc()
+
+    for _ <- 1..n_trees do
+      sample = Enum.take_random(points, psi)
+      grow_tree(sample, depth_cap)
+    end
+  end
+end
+```
+
+Note the recursion lays nodes out in pre-order and threads an `id`
+counter through, so node `0` is always the root and children point at
+the right indices — exactly the columnar layout we export next.
+
+## Grow it
+
+We grow 100 trees, each on a fresh random subsample of `psi = 64`
+points. Subsampling is deliberate: small samples make the outliers
+*even more* alone, so they get isolated even faster. We seed first so
+the forest is reproducible across re-runs.
+
+```elixir
+:rand.seed(:exsss, {7, 7, 7})
+
+psi = 64
+n_trees = 100
+training = normal_pts ++ outlier_pts
+
+forest_nodes = TinyForest.grow_forest(training, n_trees, psi)
+
+depths = Enum.map(forest_nodes, &length/1)
+{min_nodes, max_nodes} = Enum.min_max(depths)
+IO.puts("grew #{length(forest_nodes)} trees; node counts #{min_nodes}..#{max_nodes}")
+```
+
+## Export to JSON and load it
+
+Now the ship-to-device step. We turn each tree into the documented
+columnar shape: parallel `feature`, `threshold`, `left`, `right`,
+`size` arrays where node `0` is the root, `-1` marks a leaf, and you go
+**left when `x[feature] <= threshold`**. This is the same shape the
+`sklearn` exporter in the moduledoc produces — the device cannot tell
+where the forest came from.
+
+```elixir
+defmodule Export do
+  def tree_to_columns(nodes) do
+    sorted = Enum.sort_by(nodes, & &1.id)
+
+    %{
+      "feature" => Enum.map(sorted, & &1.feature),
+      "threshold" => Enum.map(sorted, & &1.threshold),
+      "left" => Enum.map(sorted, & &1.left),
+      "right" => Enum.map(sorted, & &1.right),
+      "size" => Enum.map(sorted, & &1.size)
+    }
+  end
+
+  def forest_to_model(forest, psi) do
+    %{
+      "psi" => psi,
+      "n_features" => 2,
+      "trees" => Enum.map(forest, &tree_to_columns/1)
+    }
+  end
+end
+
+model_map = Export.forest_to_model(forest_nodes, psi)
+Map.take(model_map, ["psi", "n_features"])
+```
+
+To prove the JSON path actually works end to end, we round-trip the
+model through `:json.encode` and `:json.decode` (OTP 27+) — bytes out,
+bytes in — before handing the decoded maps to `Outlier.load!/1`.
+
+```elixir
+json_iodata = :json.encode(model_map)
+json_string = IO.iodata_to_binary(json_iodata)
+IO.puts("encoded model is #{byte_size(json_string)} bytes of JSON")
+
+decoded = :json.decode(json_string)
+model = Outlier.load!(decoded)
+
+%{loaded_trees: length(model.trees), psi: model.psi, n_features: model.n_features}
+```
+
+`load!` validated every tree (ragged columns, bad indices, etc. would
+have raised) and converted them to a fast traversal form. From here on
+we only touch the public API: `Outlier.score/2`.
+
+## Path lengths, tree by tree
+
+Before the score, let's see the raw signal it's built from: how deep
+does a point fall in each tree? We walk a handful of trees by hand for
+one clear outlier and one normal point and compare the depth each
+reaches.
+
+```elixir
+defmodule Walk do
+  # Depth at which `x` lands in a leaf of one columnar tree.
+  def depth(tree, x) do
+    walk(tree, x, 0, 0)
+  end
+
+  defp walk(tree, x, node, depth) do
+    feat = Enum.at(tree["feature"], node)
+
+    if feat == -1 do
+      depth
+    else
+      thresh = Enum.at(tree["threshold"], node)
+
+      next =
+        if Enum.at(x, feat) <= thresh,
+          do: Enum.at(tree["left"], node),
+          else: Enum.at(tree["right"], node)
+
+      walk(tree, x, next, depth + 1)
+    end
+  end
+end
+
+outlier_x = [38.0, 200.0]
+normal_x = [40.0, 100.0]
+
+rows =
+  model_map["trees"]
+  |> Enum.take(12)
+  |> Enum.with_index(1)
+  |> Enum.map(fn {tree, i} ->
+    %{
+      "tree #" => i,
+      "depth(outlier)" => Walk.depth(tree, outlier_x),
+      "depth(normal)" => Walk.depth(tree, normal_x)
+    }
+  end)
+
+Kino.DataTable.new(rows)
+```
+
+Scan the two depth columns: the normal point bottoms out at the depth
+cap in every tree, while the outlier lands shallower in most of them and
+never deeper. No single tree is decisive — a few tie — but the pattern
+across independent random trees is what makes the signal trustworthy.
+
+## The c(n) curve and the score
+
+There's one subtlety. A leaf isn't always a single point — at the depth
+cap a leaf can still hold a whole crowd of `n` training points we
+stopped splitting. We don't pretend that crowd was isolated; instead we
+*charge* the path the cuts that *would* have been needed to keep
+splitting `n` points apart. That estimated extra cost is `c(n)`, the
+average path length of an unsuccessful search in a binary tree over `n`
+points. It is public (though `@doc false`) as `Outlier.c/1`.
+
+```elixir
+c_rows =
+  for n <- [2, 4, 8, 16, 32, 64, 128, 256] do
+    %{"n" => n, "c(n)" => Float.round(Outlier.c(n), 3)}
+  end
+
+c_chart_data = for n <- 2..256, do: %{n: n, c: Outlier.c(n)}
+
+c_chart =
+  Vl.new(width: 700, height: 300, title: "c(n): expected cuts to isolate one of n points")
+  |> Vl.data_from_values(c_chart_data)
+  |> Vl.mark(:line, color: "steelblue")
+  |> Vl.encode_field(:x, "n", type: :quantitative)
+  |> Vl.encode_field(:y, "c", type: :quantitative, title: "c(n)")
+
+Kino.Layout.grid([Kino.DataTable.new(c_rows), c_chart], columns: 1)
+```
+
+The curve climbs but flattens — doubling the crowd adds only a little.
+The value at `n = psi` is the yardstick for the whole score. With that,
+the score formula is:
+
+> `s = 2 ^ ( -mean_path / c(psi) )`
+
+In words: take a point's **mean path length** over all trees, divide by
+the path length an *ordinary* point would be expected to have
+(`c(psi)`), and map it onto `(0, 1]`. A point whose paths are about as
+long as expected scores **~0.5**; a point buried even deeper in a dense
+crowd than average scores *below* 0.5; a point cornered suspiciously
+fast — short paths — scores **toward 1.0**. The conventional reading
+treats ~0.5 as ordinary and pushes the alarm above ~0.6–0.7.
+
+```elixir
+IO.puts("c(psi=#{psi}) = #{Float.round(Outlier.c(psi), 4)}")
+
+for {label, vec} <- [normal: normal_x] ++ Enum.with_index(outlier_pts, &{:"outlier#{&2 + 1}", &1}) do
+  {label, Float.round(Outlier.score(model, vec), 3)}
+end
+```
+
+The normal point scores about **0.39** — below 0.5, because our blob is
+*denser* than a random `psi`-point subsample, so ordinary points fall
+even deeper than the baseline expects. Each outlier scores **0.65–0.76**,
+clearly into anomalous territory. That is the whole detector working:
+nothing was told these three points were special — the random cuts
+found them.
+
+## The score landscape
+
+To see the detector's whole opinion at once, we score a 60×60 grid over
+the `(cpu, latency)` plane — `Outlier.score/2` takes a batch (a list of
+`[x, y]` vectors) and returns a score per cell — and draw it as a heat
+map with the training points and outliers laid on top.
+
+```elixir
+xs = for i <- 0..59, do: 20.0 + i * (95.0 - 20.0) / 59
+ys = for j <- 0..59, do: 60.0 + j * (215.0 - 60.0) / 59
+
+grid_vectors = for y <- ys, x <- xs, do: [x, y]
+grid_scores = Outlier.score(model, grid_vectors)
+
+heat_rows =
+  Enum.zip(grid_vectors, grid_scores)
+  |> Enum.map(fn {[x, y], s} -> %{cpu: x, latency: y, score: s} end)
+
+length(heat_rows)
+```
+
+```elixir
+heat =
+  Vl.new()
+  |> Vl.data_from_values(heat_rows)
+  |> Vl.mark(:rect)
+  |> Vl.encode_field(:x, "cpu", type: :quantitative, bin: [maxbins: 60])
+  |> Vl.encode_field(:y, "latency", type: :quantitative, bin: [maxbins: 60])
+  |> Vl.encode_field(:color, "score",
+    type: :quantitative,
+    scale: [scheme: "inferno", domain: [0.39, 0.77]]
+  )
+
+overlay =
+  Vl.new()
+  |> Vl.data_from_values(all_rows)
+  |> Vl.mark(:circle, size: 40, opacity: 0.8, stroke: "white", strokeWidth: 0.5)
+  |> Vl.encode_field(:x, "cpu", type: :quantitative)
+  |> Vl.encode_field(:y, "latency", type: :quantitative)
+  |> Vl.encode_field(:color, "kind",
+    type: :nominal,
+    scale: [range: ["#4fc3f7", "#ffffff"]]
+  )
+
+Vl.new(width: 500, height: 500, title: "Anomaly score landscape")
+|> Vl.layers([heat, overlay])
+```
+
+Read the colours: the blob of normal points sits in a cool (dark)
+basin (scores around 0.39), while it gets *hotter* toward the empty far
+corners and, especially, around the three outliers. Hot means "cornered
+fast" means anomalous. The outlier neighbourhoods push to ~0.65–0.77,
+well clear of the ordinary 0.5 line.
+
+## Watch the score settle as the forest grows
+
+One forest is a bundle of random trees, so any single tree's verdict is
+noisy — the *averaging* is what makes the score stable. Use the input
+to grow forests of different sizes (on the same seed) and watch the
+outlier's score settle as you add trees.
+
+```elixir
+trees_input =
+  Kino.Input.select("trees in forest", [{10, "10"}, {30, "30"}, {100, "100"}],
+    default: 30
+  )
+```
+
+```elixir
+:rand.seed(:exsss, {7, 7, 7})
+
+chosen_trees = Kino.Input.read(trees_input)
+small_forest = TinyForest.grow_forest(training, chosen_trees, psi)
+small_map = Export.forest_to_model(small_forest, psi)
+small_model = Outlier.load!(:json.decode(IO.iodata_to_binary(:json.encode(small_map))))
+
+%{
+  "trees" => chosen_trees,
+  "score(outlier)" => Float.round(Outlier.score(small_model, [38.0, 200.0]), 3),
+  "score(normal)" => Float.round(Outlier.score(small_model, [40.0, 100.0]), 3)
+}
+```
+
+With few trees the outlier's score is jumpier (about 0.59 at 10 trees,
+climbing toward ~0.65 by 100); the normal point sits steadily around
+0.39 throughout. More trees buy stability, not a different answer — the
+outlier is anomalous at every forest size.
+
+## Why both Outlier *and* Novelty exist
+
+The forest and `MobiusSmarts.Detect.Novelty` (Mahalanobis, from
+notebook 07) both answer "is this combination of metrics weird?" — but
+they see different shapes. The forest carves the space with
+axis-aligned cuts and can wrap *several* separate normal regions.
+Mahalanobis fits a single ellipse: one centre, one correlation. When
+"normal" has **two operating modes**, the ellipse averages them and
+calls the empty space *between* them normal-ish — exactly where the
+forest correctly stays suspicious.
+
+Let's build a two-mode dataset and fit both on it.
+
+```elixir
+:rand.seed(:exsss, {9, 9, 9})
+
+mode_a = for _ <- 1..150, do: [25.0 + :rand.normal() * 4.0, 80.0 + :rand.normal() * 8.0]
+mode_b = for _ <- 1..150, do: [70.0 + :rand.normal() * 4.0, 170.0 + :rand.normal() * 8.0]
+two_mode = mode_a ++ mode_b
+
+nov_model = Novelty.fit(two_mode)
+
+:rand.seed(:exsss, {3, 1, 4})
+forest2_nodes = TinyForest.grow_forest(two_mode, 100, 64)
+forest2_map = Export.forest_to_model(forest2_nodes, 64)
+forest2 = Outlier.load!(:json.decode(IO.iodata_to_binary(:json.encode(forest2_map))))
+
+mode_rows = for [x, y] <- two_mode, do: %{cpu: x, latency: y}
+length(mode_rows)
+```
+
+Now score the same grid two ways: the forest's `(0,1]` anomaly score
+and Novelty's distance (bigger = more novel). We draw them side by side.
+
+```elixir
+gx = for i <- 0..49, do: 10.0 + i * (85.0 - 10.0) / 49
+gy = for j <- 0..49, do: 50.0 + j * (200.0 - 50.0) / 49
+grid2 = for y <- gy, x <- gx, do: [x, y]
+
+forest2_scores = Outlier.score(forest2, grid2)
+nov_scores = Novelty.score(nov_model, grid2) |> Nx.to_flat_list()
+
+forest2_rows =
+  Enum.zip(grid2, forest2_scores)
+  |> Enum.map(fn {[x, y], s} -> %{cpu: x, latency: y, val: s} end)
+
+nov_rows =
+  Enum.zip(grid2, nov_scores)
+  |> Enum.map(fn {[x, y], s} -> %{cpu: x, latency: y, val: s} end)
+
+mid = [47.5, 125.0]
+
+IO.puts("empty middle point #{inspect(mid)}:")
+IO.puts("  forest score  = #{Float.round(Outlier.score(forest2, mid), 3)}")
+IO.puts("  novelty score = #{Float.round(Novelty.score(nov_model, mid), 3)}")
+:ok
+```
+
+```elixir
+build_heat = fn rows, title, scheme ->
+  heat =
+    Vl.new()
+    |> Vl.data_from_values(rows)
+    |> Vl.mark(:rect)
+    |> Vl.encode_field(:x, "cpu", type: :quantitative, bin: [maxbins: 50])
+    |> Vl.encode_field(:y, "latency", type: :quantitative, bin: [maxbins: 50])
+    |> Vl.encode_field(:color, "val", type: :quantitative, scale: [scheme: scheme])
+
+  pts =
+    Vl.new()
+    |> Vl.data_from_values(mode_rows)
+    |> Vl.mark(:circle, size: 20, opacity: 0.5, color: "white")
+    |> Vl.encode_field(:x, "cpu", type: :quantitative)
+    |> Vl.encode_field(:y, "latency", type: :quantitative)
+
+  Vl.new(width: 350, height: 350, title: title)
+  |> Vl.layers([heat, pts])
+end
+
+Kino.Layout.grid(
+  [
+    build_heat.(forest2_rows, "Isolation Forest", "inferno"),
+    build_heat.(nov_rows, "Novelty (Mahalanobis)", "viridis")
+  ],
+  columns: 2
+)
+```
+
+Look at the **empty gap between the two clouds**. On the forest map it
+is hot — the forest never saw points there, so it's suspicious. On the
+Novelty map that same gap sits near the centre of the one big ellipse,
+so it reads as *low* distance — "normal-ish" — which is wrong here.
+
+The honest flip side, in prose: the forest cuts only along the axes and
+is scale-free per feature, so it is **blind to a rotated correlation** —
+a long tilted cloud where `cpu` and `latency` move together. Mahalanobis
+fits that tilt exactly. Neither sees everything. Run both; they cover
+each other's blind spots.
+
+## Honest caveats
+
+The forest is powerful precisely because it learned a specific notion
+of normal — which is also its fragility:
+
+* **Scores only mean something relative to the training distribution.**
+  A 0.7 here is not comparable to a 0.7 from a model trained on
+  different data. Read scores against the model that produced them.
+* **Features must be built identically to training** — same features,
+  same order, same units. Swap two columns or change a unit and the
+  cuts land on the wrong axis; the score becomes noise that still looks
+  like a number.
+* **Models go stale.** When the fleet's notion of normal drifts —
+  new firmware, new hardware revision, seasonal load — yesterday's
+  outliers become today's normal. Retrain fleet-side and re-ship the
+  JSON. The device side never changes; only the model it loads does.
+
+The device's job is small and fixed: build the feature vector the same
+way every time, `load!` the current model, `score/2`. All the judgement
+lives in the model — and the model lives in the JSON you ship.

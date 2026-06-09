@@ -1,0 +1,507 @@
+# Change-point detection — binary segmentation
+
+## The question
+
+You have months of a metric sitting in storage — request latency, CPU,
+memory, error rate. Looking back over that history, you want one thing:
+**when did this metric change character, and how many times?** Not "is
+something wrong right now" — that ship has sailed. You want a short list
+of timestamps to lay alongside your deploy log and your config pushes,
+so you can say "latency changed on the 14th, and again on the 22nd —
+what shipped on those days?"
+
+This is the job `MobiusSmarts.Detect.Changepoint.detect/2` does. It
+runs as a periodic hindsight sweep, not a live alarm. The whole notebook
+builds, piece by piece, the one idea behind it: try every possible place
+to *cut* the series in two, and keep only the cuts that make each half
+genuinely more consistent than dumb luck would give you.
+
+We'll synthesize device-health series — latency after a deploy, CPU
+after a config push — rather than touch real storage, so every cell is
+reproducible.
+
+```elixir
+Mix.install([
+  {:mobius_smarts, path: Path.expand("..", __DIR__)},
+  {:kino, "~> 0.14"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+```
+
+```elixir
+alias VegaLite, as: Vl
+alias MobiusSmarts.Detect.Changepoint
+```
+
+## One level shift
+
+Here's the simplest version of the problem. A service had a deploy
+halfway through this window. Before it, request latency hovered around
+40 ms; after it, around 55 ms. Each point is one summary window's average
+latency, and it carries noise — random jitter from load, GC pauses, the
+network. We'll add Gaussian noise (a bell-curve wobble) with a standard
+deviation of 3 ms. Standard deviation is just "the typical size of the
+wobble."
+
+```elixir
+:rand.seed(:exsss, {3, 1, 4})
+
+gauss = fn sd ->
+  sd * :math.sqrt(-2.0 * :math.log(:rand.uniform())) *
+    :math.cos(2.0 * :math.pi() * :rand.uniform())
+end
+
+n = 60
+true_cp = 30
+
+latency =
+  for i <- 0..(n - 1) do
+    level = if i < true_cp, do: 40.0, else: 55.0
+    level + gauss.(3.0)
+  end
+
+left_mean = latency |> Enum.take(true_cp) |> Enum.sum() |> Kernel./(true_cp)
+right_mean = latency |> Enum.drop(true_cp) |> Enum.sum() |> Kernel./(n - true_cp)
+
+{Float.round(left_mean, 1), Float.round(right_mean, 1)}
+```
+
+The two segment averages come out to about 40.3 ms and 54.2 ms — close
+to the levels we injected, with the noise averaging out. Now chart the
+raw series with those two averages drawn as flat lines. **Look for the
+moment the dots jump from clustering around the lower line to clustering
+around the upper one — that vertical step is the change point we want to
+find automatically.**
+
+```elixir
+points = Enum.with_index(latency) |> Enum.map(fn {y, i} -> %{i: i, latency: y} end)
+
+means =
+  Enum.with_index(latency)
+  |> Enum.map(fn {_y, i} ->
+    %{i: i, mean: if(i < true_cp, do: left_mean, else: right_mean)}
+  end)
+
+Vl.new(width: 700, height: 300, title: "Latency, with each segment's own average")
+|> Vl.layers([
+  Vl.new()
+  |> Vl.data_from_values(points)
+  |> Vl.mark(:point, filled: true, opacity: 0.7)
+  |> Vl.encode_field(:x, "i", type: :quantitative, title: "window")
+  |> Vl.encode_field(:y, "latency", type: :quantitative, title: "ms", scale: [zero: false]),
+  Vl.new()
+  |> Vl.data_from_values(means)
+  |> Vl.mark(:line, color: "red", stroke_dash: [6, 4])
+  |> Vl.encode_field(:x, "i", type: :quantitative)
+  |> Vl.encode_field(:y, "mean", type: :quantitative)
+])
+```
+
+## Wiggle: scoring every possible cut
+
+How do we *find* that cut without knowing it in advance? Here's the
+trick: for every possible cut position, split the series into a left half
+and a right half, give each half its **own** average, and measure the
+total leftover "wiggle" — how far the points stray from the average of
+the half they're in.
+
+"Wiggle" is informally the **variance**: the sum of squared distances
+from a segment's own mean. Squaring means a point twice as far away
+counts four times as much, so big strays dominate. A cut at the right
+place gives each half a tight, low-wiggle fit. A cut in the wrong place
+forces one half to straddle both levels, inflating its wiggle.
+
+We compute, for every cut position, `wiggle(left) + wiggle(right)`, and
+also the **gain**: how much smaller that is than the wiggle of the whole
+series treated as one segment. (An aside: the library does this in a
+single pass using prefix sums — running cumulative totals — so scanning
+all 50-odd cut positions costs no more than one walk through the data.)
+
+```elixir
+wiggle = fn list ->
+  m = Enum.sum(list) / length(list)
+  Enum.reduce(list, 0.0, fn x, acc -> acc + (x - m) * (x - m) end)
+end
+
+total_wiggle = wiggle.(latency)
+
+cut_costs =
+  for tau <- 5..(n - 5) do
+    left = Enum.take(latency, tau)
+    right = Enum.drop(latency, tau)
+    cost = wiggle.(left) + wiggle.(right)
+    %{tau: tau, cost: cost, gain: total_wiggle - cost}
+  end
+
+best = Enum.min_by(cut_costs, & &1.cost)
+{best.tau, Float.round(best.gain, 0)}
+```
+
+The best cut lands at window 30 — exactly where we put the change — and
+it reduces the wiggle by about 2911. Chart cost against cut position.
+**Look for the single sharp valley: that lowest point is the cut the
+algorithm picks.**
+
+```elixir
+Vl.new(width: 700, height: 280, title: "Total wiggle vs cut position")
+|> Vl.data_from_values(cut_costs)
+|> Vl.mark(:line, point: true)
+|> Vl.encode_field(:x, "tau", type: :quantitative, title: "cut after window")
+|> Vl.encode_field(:y, "cost", type: :quantitative, title: "left wiggle + right wiggle",
+  scale: [zero: false])
+```
+
+## The conspiracy-theory problem
+
+There's a catch, and it's the whole reason this is hard. *Any* cut
+reduces the wiggle a little — even on pure noise with no change at all.
+Give each half its own average and it will fit its own half slightly
+better than one shared average fits everything. The same way a conspiracy
+theory always explains a bit more than the boring truth: more knobs,
+tighter fit, zero meaning.
+
+Let's prove it. Here's a flat, stable CPU series — no change anywhere,
+just noise around 50% — run through the identical cut scan.
+
+```elixir
+:rand.seed(:exsss, {9, 9, 9})
+
+cpu = for _ <- 0..(n - 1), do: 50.0 + gauss.(3.0)
+
+cpu_total = wiggle.(cpu)
+
+cpu_costs =
+  for tau <- 5..(n - 5) do
+    left = Enum.take(cpu, tau)
+    right = Enum.drop(cpu, tau)
+    %{tau: tau, cost: wiggle.(left) + wiggle.(right)}
+  end
+
+cpu_best = Enum.min_by(cpu_costs, & &1.cost)
+{cpu_best.tau, Float.round(cpu_total - cpu_best.cost, 1)}
+```
+
+The best cut on pure noise "explains" a gain of only about 6.5 — versus
+2911 for the real shift. **Compare the two valleys below: the real shift
+has a deep, unmistakable dip; the noise has a shallow, meaningless
+ripple where any position is about as good as any other.**
+
+```elixir
+shift_norm =
+  Enum.map(cut_costs, fn r -> %{tau: r.tau, cost: r.cost - best.cost, series: "real shift"} end)
+
+noise_norm =
+  Enum.map(cpu_costs, fn r -> %{tau: r.tau, cost: r.cost - cpu_best.cost, series: "pure noise"} end)
+
+Vl.new(width: 700, height: 280, title: "Cut cost above its own best (lower valley = sharper signal)")
+|> Vl.data_from_values(shift_norm ++ noise_norm)
+|> Vl.mark(:line)
+|> Vl.encode_field(:x, "tau", type: :quantitative, title: "cut after window")
+|> Vl.encode_field(:y, "cost", type: :quantitative, title: "cost − best cost")
+|> Vl.encode_field(:color, "series", type: :nominal)
+```
+
+So we need a **skepticism threshold**: a bar that the best gain must
+clear before we believe the cut is real. The library uses a BIC-style
+penalty, `2·σ²·ln(n)` — where σ is the noise level and n the series
+length. In words: *the improvement you'd expect from sheer luck, scaled
+to the series' own noisiness and length.* Noisier data and longer series
+hand out bigger lucky gains, so the bar rises to match.
+
+```elixir
+# σ estimated from window-to-window differences (more on this later);
+# here, the plain version is good enough to show the bar.
+sigma_of = fn list ->
+  diffs =
+    list
+    |> Enum.chunk_every(2, 1, :discard)
+    |> Enum.map(fn [a, b] -> b - a end)
+
+  ms = Enum.reduce(diffs, 0.0, fn d, a -> a + d * d end) / length(diffs)
+  :math.sqrt(ms / 2.0)
+end
+
+penalty = fn list, len -> 2.0 * :math.pow(sigma_of.(list), 2) * :math.log(len) end
+
+bars = [
+  %{series: "real shift", gain: best.gain, bar: penalty.(latency, n)},
+  %{series: "pure noise", gain: cpu_total - cpu_best.cost, bar: penalty.(cpu, n)}
+]
+
+Kino.DataTable.new(
+  Enum.map(bars, fn b ->
+    %{
+      series: b.series,
+      best_gain: Float.round(b.gain, 1),
+      skepticism_bar: Float.round(b.bar, 1),
+      verdict: if(b.gain > b.bar, do: "ACCEPT", else: "reject")
+    }
+  end)
+)
+```
+
+The real shift clears its bar by a mile (gain ~2911 vs a bar near 76);
+pure noise falls far short (gain ~6.5 vs a bar near 63). The penalty is
+exactly what separates a real change from a flattering coincidence.
+
+## Recursion: more than one change
+
+One cut finds at most one change. Real history has several. Binary
+segmentation handles this by **recursion**: make the single best cut,
+then re-run the whole procedure independently on the left half and the
+right half, and keep going until no cut anywhere clears its bar.
+
+Here's latency that ramped up after a deploy at window 20, then got
+rolled back at window 40 — flat low, up, back down. Three segments, two
+true changes.
+
+```elixir
+:rand.seed(:exsss, {2, 4, 6})
+
+cp1 = 20
+cp2 = 40
+
+rollback =
+  for i <- 0..(n - 1) do
+    level =
+      cond do
+        i < cp1 -> 30.0
+        i < cp2 -> 70.0
+        true -> 45.0
+      end
+
+    level + gauss.(2.5)
+  end
+
+# The first cut: best single split over the whole series.
+two_total = wiggle.(rollback)
+
+first =
+  for tau <- 5..(n - 5) do
+    %{tau: tau, cost: wiggle.(Enum.take(rollback, tau)) + wiggle.(Enum.drop(rollback, tau))}
+  end
+  |> Enum.min_by(& &1.cost)
+
+{first.tau, Float.round(two_total - first.cost, 0)}
+```
+
+The first cut lands at window 20 with a huge gain (~9506). That carves
+off the flat-low opening; the remaining right half still contains the
+70→45 rollback, which the recursion then finds on its own. Let
+`detect/2` run the full recursion and draw its answers as vertical rules
+over the series. **Look for two vertical lines sitting right on the two
+places the level changes — at windows 20 and 40.**
+
+```elixir
+indices = Changepoint.detect(rollback)
+
+series_pts =
+  Enum.with_index(rollback) |> Enum.map(fn {y, i} -> %{i: i, latency: y} end)
+
+rules = Enum.map(indices, fn i -> %{i: i} end)
+
+Vl.new(width: 700, height: 300, title: "Two changes found by recursion: #{inspect(indices)}")
+|> Vl.layers([
+  Vl.new()
+  |> Vl.data_from_values(series_pts)
+  |> Vl.mark(:line, point: true, opacity: 0.7)
+  |> Vl.encode_field(:x, "i", type: :quantitative, title: "window")
+  |> Vl.encode_field(:y, "latency", type: :quantitative, title: "ms", scale: [zero: false]),
+  Vl.new()
+  |> Vl.data_from_values(rules)
+  |> Vl.mark(:rule, color: "red", size: 2)
+  |> Vl.encode_field(:x, "i", type: :quantitative)
+])
+```
+
+`detect/2` returns `[20, 40]` — an exact match for the deploy at 20 and
+the rollback at 40. Each returned index is the first window of a new
+segment.
+
+## The self-defeating trap
+
+The skepticism bar depends on σ, the noise level. So where does σ come
+from? The natural idea: look at window-to-window differences. On a stable
+stretch, consecutive windows differ only by noise, so the typical
+difference size tells you σ. (For independent noise, the variance of a
+difference is twice the variance of one point, hence a `/√2` correction.)
+
+But here's the trap. **At each real change, there's one giant
+difference** — the step itself. If we estimate σ by plain-averaging the
+squared differences, those few giant ones drag the estimate up. A bigger
+σ means a higher bar — and a high enough bar can hide the very change
+that created the giant difference. The signal sabotages its own
+detection.
+
+Look at the differences of the rollback series. A couple of them are
+enormous compared to the rest.
+
+```elixir
+diffs =
+  rollback
+  |> Enum.chunk_every(2, 1, :discard)
+  |> Enum.map(fn [a, b] -> b - a end)
+
+diffs
+|> Enum.with_index()
+|> Enum.sort_by(fn {d, _} -> -abs(d) end)
+|> Enum.take(3)
+|> Enum.map(fn {d, i} -> %{between_windows: "#{i}→#{i + 1}", diff_ms: Float.round(d, 1)} end)
+|> Kino.DataTable.new()
+```
+
+The two biggest differences (about +36 at the deploy and −26 at the
+rollback) are the changes themselves. Now compare two ways of turning
+these differences into a σ estimate. We injected a true noise σ of 2.5.
+
+The **plain** way averages all squared differences. The **robust** way
+uses the **median** — the middle value when the differences are sorted,
+which a couple of freak outliers can't budge — via the MAD. MAD is the
+*median absolute deviation*: the median distance of each difference from
+the differences' median, i.e. "the typical difference, ignoring the
+freaks." The library's σ is `1.4826 · MAD / √2`: *the typical
+window-to-window difference, with the freak ones ignored*, rescaled so
+that for clean bell-curve noise it lands on the true σ.
+
+```elixir
+median = fn list ->
+  s = Enum.sort(list)
+  len = length(s)
+  mid = div(len, 2)
+  if rem(len, 2) == 1, do: Enum.at(s, mid), else: (Enum.at(s, mid - 1) + Enum.at(s, mid)) / 2.0
+end
+
+sigma_naive =
+  :math.sqrt(Enum.reduce(diffs, 0.0, fn d, a -> a + d * d end) / length(diffs) / 2.0)
+
+med = median.(diffs)
+mad = median.(Enum.map(diffs, fn d -> abs(d - med) end))
+sigma_robust = 1.4826 * mad / :math.sqrt(2.0)
+
+Kino.DataTable.new([
+  %{
+    method: "plain average of squared diffs",
+    sigma: Float.round(sigma_naive, 2),
+    skepticism_bar: Float.round(2.0 * sigma_naive * sigma_naive * :math.log(n), 0)
+  },
+  %{
+    method: "robust (median / MAD)",
+    sigma: Float.round(sigma_robust, 2),
+    skepticism_bar: Float.round(2.0 * sigma_robust * sigma_robust * :math.log(n), 0)
+  },
+  %{method: "true injected noise", sigma: 2.5, skepticism_bar: nil}
+])
+```
+
+The plain estimate is wildly inflated — σ ≈ 4.58 against a true 2.5,
+nearly double — and it lifts the skepticism bar to ~172. The robust
+estimate, σ ≈ 2.21, sits right next to the truth and keeps the bar near
+40. The robust noise estimate is what lets the changes stay visible: they
+can't hide themselves by inflating it.
+
+## The min_size guard
+
+One more way a cut can be a flattering coincidence: a single freaky
+window. If we let segments be one window long, a lone spike could carve
+itself its own tiny "segment" and pretend to be a change. The `:min_size`
+option (default 5 windows) forbids that — no segment shorter than the
+floor.
+
+Here's a stable series — baseline 20, with four transient one-window
+spikes, like brief GC pauses — that never actually changes character.
+
+```elixir
+:rand.seed(:exsss, {7, 7, 7})
+
+spike_at = MapSet.new([12, 27, 41, 53])
+
+spiky =
+  for i <- 0..(n - 1) do
+    base = 20.0 + gauss.(1.2)
+    if MapSet.member?(spike_at, i), do: base + 15.0, else: base
+  end
+
+%{
+  default_min_size_5: Changepoint.detect(spiky),
+  dropped_to_min_size_1: Changepoint.detect(spiky, min_size: 1)
+}
+```
+
+With the default guard, `detect` returns `[]` — correctly, nothing
+changed; the spikes are transients, not a new level, and neither the
+penalty nor the size floor lets them become segments. The spikes are real
+data, not a sustained shift in character, so the right answer is "no
+change points." (Drop the floor far enough on a *strong* enough spike and
+the algorithm will start bracketing individual spikes as their own
+segments — exactly the over-fitting `:min_size` exists to prevent.)
+
+## Tune it yourself
+
+Move the two sliders, then **re-run the two cells below them**. The first
+slider sets how big the level shift is (in ms); the second sets the noise.
+Find where the change stops earning its keep: shrink the shift or crank
+the noise until `detect` either drifts off the true location (window 30)
+or gives up entirely.
+
+```elixir
+shift_input = Kino.Input.range("Shift size (ms)", min: 0, max: 20, step: 1, default: 15)
+noise_input = Kino.Input.range("Noise σ (ms)", min: 1, max: 8, step: 1, default: 3)
+Kino.Layout.grid([shift_input, noise_input], columns: 2)
+```
+
+```elixir
+shift = Kino.Input.read(shift_input)
+noise = Kino.Input.read(noise_input)
+
+:rand.seed(:exsss, {3, 1, 4})
+
+tuned =
+  for i <- 0..(n - 1) do
+    level = if i < true_cp, do: 40.0, else: 40.0 + shift
+    level + gauss.(noise)
+  end
+
+found = Changepoint.detect(tuned)
+
+tuned_pts = Enum.with_index(tuned) |> Enum.map(fn {y, i} -> %{i: i, v: y} end)
+tuned_rules = Enum.map(found, fn i -> %{i: i} end)
+
+Vl.new(width: 700, height: 300,
+  title: "shift=#{shift} noise=#{noise} → detect: #{inspect(found)} (true change at 30)")
+|> Vl.layers([
+  Vl.new()
+  |> Vl.data_from_values(tuned_pts)
+  |> Vl.mark(:line, point: true, opacity: 0.7)
+  |> Vl.encode_field(:x, "i", type: :quantitative, title: "window")
+  |> Vl.encode_field(:y, "v", type: :quantitative, title: "ms", scale: [zero: false]),
+  Vl.new()
+  |> Vl.data_from_values(tuned_rules)
+  |> Vl.mark(:rule, color: "red", size: 2)
+  |> Vl.encode_field(:x, "i", type: :quantitative)
+])
+```
+
+With the defaults (shift 15, noise 3) the rule sits dead on window 30.
+Pull the shift down to about 4 and it starts drifting off the true spot;
+pull it to 3, or push the noise to 5 against a small shift, and `detect`
+returns `[]` — the change no longer beats the skepticism bar. That bar is
+the whole point: it would rather miss a marginal change than invent one.
+
+## Where this fits
+
+`Changepoint` is the **hindsight** member of the detector stack.
+`MobiusSmarts.Detect.Shift` (the EWMA chart, notebook 02) and
+`MobiusSmarts.Detect.Drift` (CUSUM, notebook 03) run *live* and
+answer "is something happening *now*?" — they react as data streams in,
+with only the past to lean on. `Changepoint` runs as a periodic sweep
+over stored history and answers "what happened, precisely, and how many
+times?" Because it sees **both sides** of each change, it can place the
+timestamp far more accurately than any live detector that only ever saw
+the run-up.
+
+The natural pipeline: run Shift and Drift continuously for alerting; run
+this sweep on a schedule to produce clean, well-placed change-point
+timestamps; and feed each accepted change point to
+`MobiusSmarts.Detect.Novelty` (notebook 07) as a signal to refit its
+baseline — because a confirmed change in character is exactly when the
+old "normal" stops being normal.

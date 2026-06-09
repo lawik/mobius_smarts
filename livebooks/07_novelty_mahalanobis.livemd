@@ -1,0 +1,416 @@
+# Novelty detection — Mahalanobis distance
+
+```elixir
+Mix.install([
+  {:mobius_smarts, path: Path.expand("..", __DIR__)},
+  {:kino, "~> 0.14"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+```
+
+```elixir
+alias VegaLite, as: Vl
+alias MobiusSmarts.Detect.Novelty
+```
+
+## The question this answers
+
+Every other detector in the stack watches one metric at a time: is CPU in
+its band, is memory in its band, is network in its band? Run a fortnight of
+them and each will happily tell you "all green."
+
+But consider a device that reports **CPU pinned at 85% while the network
+sits idle**. Look at CPU alone — 85% is high but this device hits 85% under
+load all the time, well inside its range. Look at network alone — idle is
+perfectly normal too. Each metric, individually, is unremarkable.
+
+The alarm is in the *combination*. This device's entire history says CPU and
+network move together: when it works hard, it talks on the wire. CPU pinned
+with a silent network is a state it has **never produced**. That is what
+novelty detection catches — a combination the device has no habit of making,
+even when no single coordinate is out of bounds.
+
+## The cloud
+
+A device's metrics have *habits*. When load rises, CPU and network rise
+together. To see the habit, generate a couple of weeks of healthy windows.
+
+We model it the honest way: a hidden "load" level drives both metrics, plus
+independent noise on each. (`:rand.normal/0` draws a number from the classic
+bell curve — mostly near zero, rarely far.) High load means high CPU *and*
+high network; the two are **correlated** — they tend to move in the same
+direction.
+
+```elixir
+:rand.seed(:exsss, {1, 2, 3})
+
+n_healthy = 300
+
+healthy =
+  for _ <- 1..n_healthy do
+    load = :rand.normal()
+    cpu = 50.0 + 18.0 * load + 4.0 * :rand.normal()
+    net = 400.0 + 150.0 * load + 60.0 * :rand.normal()
+    {cpu, net}
+  end
+
+healthy_rows = Enum.map(healthy, fn {cpu, net} -> [cpu, net] end)
+
+healthy_points = Enum.map(healthy, fn {cpu, net} -> %{"cpu" => cpu, "net" => net} end)
+
+Vl.new(width: 700, height: 420, title: "A fortnight of healthy windows")
+|> Vl.data_from_values(healthy_points)
+|> Vl.mark(:circle, opacity: 0.5)
+|> Vl.encode_field(:x, "cpu", type: :quantitative, title: "CPU %", scale: [zero: false])
+|> Vl.encode_field(:y, "net",
+  type: :quantitative,
+  title: "network kbps",
+  scale: [zero: false]
+)
+```
+
+The points don't fill the rectangle — they hug a diagonal **cigar** running
+lower-left to upper-right. That diagonal *is* the habit: low-CPU/low-network
+at one end, high-CPU/high-network at the other. The empty corners are the
+combinations this device never makes.
+
+## Both per-metric band checks pass
+
+Now drop in the suspicious window — high CPU, idle network — and draw the
+per-metric bands a single-metric detector would use. A common rule is "3σ":
+flag anything more than three standard deviations from the mean. (The
+**standard deviation**, σ, is the typical spread of a metric around its
+average.) We draw those four band edges as rules.
+
+```elixir
+suspicious = %{"cpu" => 88.0, "net" => 150.0}
+
+cpus = Enum.map(healthy, fn {c, _} -> c end)
+nets = Enum.map(healthy, fn {_, n} -> n end)
+
+mean_of = fn xs -> Enum.sum(xs) / length(xs) end
+std_of = fn xs ->
+  m = mean_of.(xs)
+  :math.sqrt(Enum.sum(Enum.map(xs, fn x -> (x - m) * (x - m) end)) / (length(xs) - 1))
+end
+
+cpu_mean = mean_of.(cpus)
+cpu_std = std_of.(cpus)
+net_mean = mean_of.(nets)
+net_std = std_of.(nets)
+
+bands = [
+  %{"v" => cpu_mean - 3 * cpu_std, "axis" => "cpu"},
+  %{"v" => cpu_mean + 3 * cpu_std, "axis" => "cpu"},
+  %{"v" => net_mean - 3 * net_std, "axis" => "net"},
+  %{"v" => net_mean + 3 * net_std, "axis" => "net"}
+]
+
+cpu_bands = Enum.filter(bands, &(&1["axis"] == "cpu"))
+net_bands = Enum.filter(bands, &(&1["axis"] == "net"))
+
+IO.puts("suspicious CPU 88.0 in [#{Float.round(cpu_mean - 3*cpu_std,1)}, #{Float.round(cpu_mean + 3*cpu_std,1)}]?")
+IO.puts("suspicious net 150.0 in [#{Float.round(net_mean - 3*net_std,1)}, #{Float.round(net_mean + 3*net_std,1)}]?")
+
+Vl.new(width: 700, height: 420, title: "Inside both per-metric bands, outside the cloud")
+|> Vl.layers([
+  Vl.new()
+  |> Vl.data_from_values(healthy_points)
+  |> Vl.mark(:circle, opacity: 0.35)
+  |> Vl.encode_field(:x, "cpu", type: :quantitative, title: "CPU %", scale: [zero: false])
+  |> Vl.encode_field(:y, "net", type: :quantitative, title: "network kbps", scale: [zero: false]),
+  Vl.new()
+  |> Vl.data_from_values(cpu_bands)
+  |> Vl.mark(:rule, color: "orange", stroke_dash: [4, 4])
+  |> Vl.encode_field(:x, "v", type: :quantitative),
+  Vl.new()
+  |> Vl.data_from_values(net_bands)
+  |> Vl.mark(:rule, color: "orange", stroke_dash: [4, 4])
+  |> Vl.encode_field(:y, "v", type: :quantitative),
+  Vl.new()
+  |> Vl.data_from_values([suspicious])
+  |> Vl.mark(:point, size: 220, color: "red", filled: true, shape: "triangle")
+  |> Vl.encode_field(:x, "cpu", type: :quantitative)
+  |> Vl.encode_field(:y, "net", type: :quantitative)
+])
+```
+
+The red triangle sits comfortably **inside** both orange bands — a
+per-metric detector sees nothing — yet it is visibly **outside** the cloud,
+stranded in an empty corner. Per-metric detectors check the rectangle; the
+habits live in the diagonal.
+
+## Why plain distance fails
+
+The obvious fix is "measure how far the point is from the center." Plain
+straight-line (**Euclidean**) distance treats every direction equally — its
+equal-distance contours are circles. That is exactly the wrong shape here.
+
+Compare the suspicious point with a point pushed the *same* Euclidean
+distance from the mean but **along** the cloud's long axis (high CPU *and*
+high network, a perfectly ordinary busy device).
+
+```elixir
+mean_cpu = cpu_mean
+mean_net = net_mean
+
+euclid = fn %{"cpu" => c, "net" => n} ->
+  :math.sqrt((c - mean_cpu) * (c - mean_cpu) + (n - mean_net) * (n - mean_net))
+end
+
+d_susp = euclid.(suspicious)
+
+# A point the same Euclidean distance away, but along the cigar.
+# Direction along the cigar ~ (cpu_std, net_std) normalised.
+dir_len = :math.sqrt(cpu_std * cpu_std + net_std * net_std)
+along = %{
+  "cpu" => mean_cpu + d_susp * cpu_std / dir_len,
+  "net" => mean_net + d_susp * net_std / dir_len
+}
+
+IO.puts("Euclidean distance, suspicious point : #{Float.round(d_susp, 1)}")
+IO.puts("Euclidean distance, along-axis point : #{Float.round(euclid.(along), 1)}")
+IO.inspect(along, label: "along-axis point")
+```
+
+Same number, opposite meaning. The along-axis point is a normal busy device;
+the suspicious point is a state never seen. Euclidean distance cannot tell
+them apart, because it is blind to the cloud's shape. We need a distance that
+knows the diagonal is cheap and the off-diagonal is expensive.
+
+## The trick: covariance
+
+The shape of the cloud is captured by its **covariance** — a small table
+that records, for each pair of metrics, how they move together. The diagonal
+holds each metric's **variance** (the square of its standard deviation: how
+much it spreads on its own). The off-diagonal holds the **covariance**: a
+large positive number means "when this one is high, that one tends to be high
+too." Let's compute it inline.
+
+```elixir
+cov_cpu_cpu = Enum.sum(Enum.map(cpus, fn c -> (c - cpu_mean) * (c - cpu_mean) end)) / (n_healthy - 1)
+cov_net_net = Enum.sum(Enum.map(nets, fn n -> (n - net_mean) * (n - net_mean) end)) / (n_healthy - 1)
+
+cov_cpu_net =
+  Enum.zip(cpus, nets)
+  |> Enum.map(fn {c, n} -> (c - cpu_mean) * (n - net_mean) end)
+  |> Enum.sum()
+  |> Kernel./(n_healthy - 1)
+
+Kino.DataTable.new([
+  %{"" => "CPU", "CPU" => Float.round(cov_cpu_cpu, 1), "network" => Float.round(cov_cpu_net, 1)},
+  %{"" => "network", "CPU" => Float.round(cov_cpu_net, 1), "network" => Float.round(cov_net_net, 1)}
+])
+```
+
+Read the table: the big off-diagonal number (CPU↔network) is the habit, in
+one number — strongly positive, so the two rise and fall together.
+**Mahalanobis distance** is just Euclidean distance measured *after*
+un-stretching the plane by this covariance: motion along the cigar is
+divided down to cheap, motion across it is blown up to expensive. The library
+does exactly this; one unit of score ≈ one typical variation of the device.
+
+## The heatmap
+
+Fit the model on the healthy history, then score a grid of points across the
+whole plane. `Novelty.score` takes a batch — an `{n, 2}` tensor — so we build
+the grid as one tensor and score it in a single call. Colour each grid cell
+by its score.
+
+```elixir
+model = Novelty.fit(healthy_rows)
+
+cpu_lo = (Enum.min(cpus) - 5) |> Float.floor()
+cpu_hi = (Enum.max(cpus) + 5) |> Float.ceil()
+net_lo = (Enum.min(nets) - 40) |> Float.floor()
+net_hi = (Enum.max(nets) + 40) |> Float.ceil()
+
+grid_n = 60
+cpu_axis = for i <- 0..(grid_n - 1), do: cpu_lo + (cpu_hi - cpu_lo) * i / (grid_n - 1)
+net_axis = for j <- 0..(grid_n - 1), do: net_lo + (net_hi - net_lo) * j / (grid_n - 1)
+
+grid_pairs = for c <- cpu_axis, n <- net_axis, do: [c, n]
+grid_tensor = Nx.tensor(grid_pairs, type: :f64)
+grid_scores = Novelty.score(model, grid_tensor) |> Nx.to_flat_list()
+
+grid_cells =
+  Enum.zip(grid_pairs, grid_scores)
+  |> Enum.map(fn {[c, n], s} -> %{"cpu" => c, "net" => n, "score" => min(s, 6.0)} end)
+
+heatmap =
+  Vl.new(width: 500, height: 500, title: "Mahalanobis score across the plane")
+  |> Vl.layers([
+    Vl.new()
+    |> Vl.data_from_values(grid_cells)
+    |> Vl.mark(:rect)
+    |> Vl.encode_field(:x, "cpu", type: :quantitative, bin: [maxbins: grid_n], title: "CPU %")
+    |> Vl.encode_field(:y, "net", type: :quantitative, bin: [maxbins: grid_n], title: "network kbps")
+    |> Vl.encode_field(:color, "score",
+      type: :quantitative,
+      scale: [scheme: "magma", reverse: true],
+      title: "score"
+    ),
+    Vl.new()
+    |> Vl.data_from_values(healthy_points)
+    |> Vl.mark(:circle, color: "white", opacity: 0.35, size: 12)
+    |> Vl.encode_field(:x, "cpu", type: :quantitative)
+    |> Vl.encode_field(:y, "net", type: :quantitative),
+    Vl.new()
+    |> Vl.data_from_values([suspicious])
+    |> Vl.mark(:point, size: 200, color: "red", filled: true, shape: "triangle")
+    |> Vl.encode_field(:x, "cpu", type: :quantitative)
+    |> Vl.encode_field(:y, "net", type: :quantitative)
+  ])
+
+s_susp = Novelty.score(model, [suspicious["cpu"], suspicious["net"]])
+s_typ = Novelty.score(model, [along["cpu"], along["net"]])
+s_center = Novelty.score(model, [mean_cpu, mean_net])
+
+IO.puts("score, suspicious point  : #{Float.round(s_susp, 2)}")
+IO.puts("score, along-axis point  : #{Float.round(s_typ, 2)}")
+IO.puts("score, cloud center      : #{Float.round(s_center, 2)}")
+
+heatmap
+```
+
+The equal-score bands are **ellipses aligned with the cloud**, not circles.
+The red triangle sits deep in a hot zone, while the along-axis point — the
+same Euclidean distance away — sits in a cool one. The printed scores make it
+exact: the suspicious point scores several times higher than the along-axis
+point, which sits just above the center.
+
+## Picking the threshold honestly
+
+How high a score is "too high"? Don't guess. Score every healthy history
+window and look at the distribution.
+
+```elixir
+healthy_scores = Novelty.score(model, Nx.tensor(healthy_rows, type: :f64)) |> Nx.to_flat_list()
+
+hist_rows = Enum.map(healthy_scores, fn s -> %{"score" => s} end)
+
+Vl.new(width: 700, height: 280, title: "Scores of healthy windows")
+|> Vl.data_from_values(hist_rows)
+|> Vl.mark(:bar)
+|> Vl.encode_field(:x, "score",
+  type: :quantitative,
+  bin: [maxbins: 40],
+  title: "Mahalanobis score"
+)
+|> Vl.encode(:y, aggregate: :count, title: "windows")
+```
+
+For well-behaved data there is a known result: the **squared** Mahalanobis
+score follows a chi-square curve with `n_metrics` degrees of freedom (here,
+2). That means the threshold can come from a target **false-alarm rate** —
+"I'll tolerate flagging 1% of healthy windows" — rather than a hunch. We
+demonstrate it empirically: fit on the original history, draw a *fresh*,
+larger healthy set, take the 99th percentile of its scores as the threshold,
+then check what fraction of *another* fresh healthy batch trips it.
+
+```elixir
+:rand.seed(:exsss, {9, 9, 9})
+
+gen_healthy = fn n ->
+  for _ <- 1..n do
+    load = :rand.normal()
+    cpu = 50.0 + 18.0 * load + 4.0 * :rand.normal()
+    net = 400.0 + 150.0 * load + 60.0 * :rand.normal()
+    [cpu, net]
+  end
+end
+
+calib = gen_healthy.(5000)
+calib_scores = Novelty.score(model, Nx.tensor(calib, type: :f64)) |> Nx.to_flat_list()
+
+sorted = Enum.sort(calib_scores)
+idx = round(0.99 * (length(sorted) - 1))
+threshold = Enum.at(sorted, idx)
+
+fresh = gen_healthy.(5000)
+fresh_scores = Novelty.score(model, Nx.tensor(fresh, type: :f64)) |> Nx.to_flat_list()
+trip_rate = Enum.count(fresh_scores, &(&1 > threshold)) / length(fresh_scores)
+
+IO.puts("threshold (99th pct of calibration) : #{Float.round(threshold, 2)}")
+IO.puts("fresh healthy windows over threshold : #{Float.round(trip_rate * 100, 2)}%")
+IO.puts("suspicious point score               : #{Float.round(s_susp, 2)} (#{Float.round(s_susp / threshold, 1)}x threshold)")
+```
+
+Roughly 1% of fresh healthy windows cross the threshold — close to the
+false-alarm budget we asked for — while the suspicious point blows past it by
+a wide margin (almost 3x). The threshold is a dial calibrated to a tolerance, not a magic
+number.
+
+## Try your own suspicious point
+
+Move the sliders, then re-run the cell below. Pick coordinates that are each
+individually plausible (CPU 30–90, network 50–800) but break the
+correlation — high CPU with low network, or vice versa — and watch the score.
+
+```elixir
+cpu_input = Kino.Input.range("suspicious CPU %", min: 20.0, max: 95.0, default: 88.0, step: 1.0)
+net_input = Kino.Input.range("suspicious network kbps", min: 0.0, max: 900.0, default: 150.0, step: 10.0)
+Kino.Layout.grid([cpu_input, net_input], columns: 2)
+```
+
+```elixir
+my_cpu = Kino.Input.read(cpu_input)
+my_net = Kino.Input.read(net_input)
+my_score = Novelty.score(model, [my_cpu, my_net])
+
+verdict = if my_score > threshold, do: "NOVEL — would alert", else: "within habits"
+IO.puts("point (#{my_cpu}, #{my_net}) -> score #{Float.round(my_score, 2)}  [#{verdict}]")
+```
+
+## More than two metrics
+
+Two metrics make a nice picture, but the method shines with many. Here is a
+four-metric device: CPU, temperature, network, and memory, all coupled to a
+shared load plus their own quirks (temperature lags CPU; memory drifts more
+independently). We fit, then score a healthy point and a
+correlation-breaking one.
+
+```elixir
+:rand.seed(:exsss, {4, 4, 4})
+
+four =
+  for _ <- 1..400 do
+    load = :rand.normal()
+    cpu = 50.0 + 18.0 * load + 4.0 * :rand.normal()
+    temp = 45.0 + 8.0 * load + 1.5 * :rand.normal()
+    net = 400.0 + 150.0 * load + 60.0 * :rand.normal()
+    mem = 60.0 + 6.0 * load + 5.0 * :rand.normal()
+    [cpu, temp, net, mem]
+  end
+
+model4 = Novelty.fit(four)
+
+healthy4 = [68.0, 53.0, 550.0, 66.0]
+broken4 = [85.0, 47.0, 120.0, 62.0]
+
+IO.puts("4-metric score, healthy busy device : #{Float.round(Novelty.score(model4, healthy4), 2)}")
+IO.puts("4-metric score, hot CPU + idle net  : #{Float.round(Novelty.score(model4, broken4), 2)}")
+```
+
+The healthy busy point scores low — every metric high together is the habit.
+The broken point — high CPU but cool and quiet — scores high, because it
+violates the couplings even though each value is plausible alone. The cost is
+`O(n_metrics²)` per score: a 4×4 table here, trivially a 50×50 table for the
+tens of metrics a real device watches.
+
+## Honest caveats
+
+- **It learns straight-line habits only.** Mahalanobis captures *linear*
+  correlations — cigars, not bananas. If normal behavior curves (e.g.
+  memory normal only at low *and* high load but not in between), this misses
+  it. Curved/nonlinear normality is the Isolation Forest's job (notebook 08).
+- **It needs a healthy history to fit** — a few hundred windows, and at least
+  `n_metrics + 1` of them for a full-rank covariance.
+- **A fitted model goes stale** when the device's legitimate behavior
+  changes (a firmware update shifts the habits). Refit on a schedule, or
+  after an accepted change point from `MobiusSmarts.Detect.Changepoint`
+  (notebook 05). A stale model alarms on the new-normal.
+
+It is the only cross-metric detector in the stack — every sibling watches one
+metric at a time. Run it alongside them: they guard the rectangle, it guards
+the diagonal.

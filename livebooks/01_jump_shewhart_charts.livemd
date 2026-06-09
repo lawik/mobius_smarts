@@ -1,0 +1,648 @@
+# Jump detection — Shewhart control charts
+
+## Section
+
+```elixir
+Mix.install([
+  {:mobius_smarts, path: Path.expand("..", __DIR__)},
+  {:kino, "~> 0.14"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+```
+
+```elixir
+alias VegaLite, as: Vl
+alias MobiusSmarts.Detect.Jump
+```
+
+## The two questions
+
+A device reports a metric over and over — memory used, temperature,
+request latency. We want to catch trouble. The obvious question is:
+
+> Did this metric suddenly land **way outside normal**?
+
+Most monitoring stops there. But there is a second question that
+averages alone can never answer:
+
+> Did the device get **erratic** — jittery, unstable — even though its
+> average still looks fine?
+
+A flapping network link or a sagging power rail often keeps the same
+*average* while the readings start bouncing around. That wobble is a
+classic pre-failure signature, and it is invisible to anything that
+only watches the average.
+
+This notebook builds both detectors from the ground up, using the
+real `MobiusSmarts.Detect.Jump` for detection while computing the
+key quantities inline so you can see inside the box. The core idea is
+a **tripwire calibrated to the device's own noise**: "way off" should
+mean way off *for this device*, not by some global constant.
+
+## What "normal" looks like
+
+Let's simulate a healthy device. Memory sits around 42% and jitters a
+little from reading to reading — ordinary random noise, the kind every
+real metric has.
+
+Two numbers describe this:
+
+* the **mean** — the average level the readings hover around, and
+* the **standard deviation** (written σ, "sigma") — the *typical size*
+  of the noise: how far a single reading usually strays from the mean.
+
+```elixir
+:rand.seed(:exsss, {1, 2, 3})
+
+level = 42.0
+sigma = 1.5
+readings = for _ <- 1..200, do: level + sigma * :rand.normal()
+
+mean = Enum.sum(readings) / length(readings)
+
+variance =
+  Enum.sum(Enum.map(readings, fn x -> (x - mean) * (x - mean) end)) /
+    (length(readings) - 1)
+
+std_dev = :math.sqrt(variance)
+
+%{mean: Float.round(mean, 3), std_dev: Float.round(std_dev, 3)}
+```
+
+We asked for a level of 42.0 and noise of 1.5, and measured a mean of
+about **42.08** and a standard deviation of about **1.53** — close, as
+expected. Now look at it. The chart below shows the readings, the mean
+as a solid line, and bands at ±1σ and ±3σ around it.
+
+**What to look at:** almost every point sits inside the inner ±1σ
+band, and effectively all of them inside the outer ±3σ band. That
+outer band is the tripwire we'll build the jump detector from.
+
+```elixir
+points =
+  readings
+  |> Enum.with_index()
+  |> Enum.map(fn {y, i} -> %{"i" => i, "value" => y} end)
+
+bands = [
+  %{"label" => "mean", "y" => mean},
+  %{"label" => "+1σ", "y" => mean + sigma},
+  %{"label" => "-1σ", "y" => mean - sigma},
+  %{"label" => "+3σ", "y" => mean + 3 * sigma},
+  %{"label" => "-3σ", "y" => mean - 3 * sigma}
+]
+
+Vl.new(width: 700, height: 320, title: "Healthy memory %: readings with mean and sigma bands")
+|> Vl.layers([
+  Vl.new()
+  |> Vl.data_from_values(points)
+  |> Vl.mark(:point, opacity: 0.6)
+  |> Vl.encode_field(:x, "i", type: :quantitative, title: "reading")
+  |> Vl.encode_field(:y, "value", type: :quantitative, scale: [zero: false], title: "memory %"),
+  Vl.new()
+  |> Vl.data_from_values(bands)
+  |> Vl.mark(:rule, stroke_dash: [4, 4])
+  |> Vl.encode_field(:y, "y", type: :quantitative)
+  |> Vl.encode_field(:color, "label", type: :nominal, title: "level")
+])
+```
+
+## Why three sigma?
+
+The tripwire width is three sigma. Why three? Because for ordinary
+noise, a reading landing more than 3σ from the mean is *rare* — rare
+enough that when it happens, you can trust it means something real.
+
+Let's measure exactly how rare. We draw 5,000 fresh healthy readings
+and count how many fall outside ±3σ.
+
+```elixir
+:rand.seed(:exsss, {9, 9, 9})
+
+trials = 5000
+deviations = for _ <- 1..trials, do: :rand.normal()
+outside = Enum.count(deviations, fn z -> abs(z) > 3 end)
+
+%{
+  outside_3sigma: outside,
+  of_total: trials,
+  roughly_one_in: Float.round(trials / outside, 0)
+}
+```
+
+About **14 out of 5,000** readings land outside the band — roughly
+**1 in 357**. (The exact theoretical figure is about 1 in 370; with a
+finite random sample we land near it.) That is the whole reason 3 is
+the convention: rare enough that an alarm is worth trusting, tight
+enough to still catch real trouble. Set the tripwire tighter and you
+drown in false alarms; looser and you miss things.
+
+## A real jump
+
+Now to the real input. Mobius doesn't hand us raw readings — it hands
+us **summary windows**. Each window already carries three numbers: the
+**average** of the readings in it, their **standard deviation**, and
+the **count** of how many there were. That summary *is* exactly the
+format these century-old charts were designed for.
+
+We build 60 windows of healthy memory data, then inject one bad
+window — number 41 — where the device briefly jumped to ~48%. Then we
+run `Jump.scan` with a baseline learned from healthy behavior.
+
+```elixir
+:rand.seed(:exsss, {2, 4, 6})
+
+window_count = 60
+reports_per_window = 30
+base_mean = 42.0
+base_sigma = 1.5
+
+summaries =
+  for w <- 0..(window_count - 1) do
+    bump = if w == 41, do: 6.0, else: 0.0
+    pts = for _ <- 1..reports_per_window, do: base_mean + bump + base_sigma * :rand.normal()
+    m = Enum.sum(pts) / reports_per_window
+    v = Enum.sum(Enum.map(pts, fn x -> (x - m) * (x - m) end)) / (reports_per_window - 1)
+    %{average: m, std_dev: :math.sqrt(v)}
+  end
+
+averages = Enum.map(summaries, & &1.average)
+std_devs = Enum.map(summaries, & &1.std_dev)
+
+result = Jump.scan(averages, std_devs, reports_per_window, baseline: {base_mean, base_sigma})
+
+flagged =
+  result.jumps
+  |> Nx.to_flat_list()
+  |> Enum.with_index()
+  |> Enum.filter(fn {f, _} -> f == 1 end)
+  |> Enum.map(fn {_, i} -> i end)
+
+%{flagged_windows: flagged, average_at_41: Float.round(Enum.at(averages, 41), 2)}
+```
+
+`scan` flagged exactly **window 41**, where the average climbed to
+about **47.8%**. The `:baseline` option is the calibration step: we
+told it what healthy looks like (mean 42, sigma 1.5), and it drew the
+band from that. The band's edges are the **UCL** and **LCL** — upper
+and lower control limits, the tripwire lines.
+
+**What to look at:** every window sits comfortably inside the band
+except the single red point at window 41, which pokes through the
+upper limit.
+
+```elixir
+ucl = Nx.to_flat_list(result.jump_ucl)
+lcl = Nx.to_flat_list(result.jump_lcl)
+
+series =
+  averages
+  |> Enum.with_index()
+  |> Enum.map(fn {a, i} ->
+    %{"w" => i, "avg" => a, "ucl" => Enum.at(ucl, i), "lcl" => Enum.at(lcl, i)}
+  end)
+
+alarms = Enum.filter(series, fn row -> row["w"] in flagged end)
+
+Vl.new(width: 700, height: 320, title: "X̄ chart: window averages vs control limits")
+|> Vl.layers([
+  Vl.new()
+  |> Vl.data_from_values(series)
+  |> Vl.mark(:line, point: true, color: "#4477aa")
+  |> Vl.encode_field(:x, "w", type: :quantitative, title: "window")
+  |> Vl.encode_field(:y, "avg", type: :quantitative, scale: [zero: false], title: "average memory %"),
+  Vl.new()
+  |> Vl.data_from_values(series)
+  |> Vl.mark(:line, stroke_dash: [4, 4], color: "#cc6677")
+  |> Vl.encode_field(:x, "w", type: :quantitative)
+  |> Vl.encode_field(:y, "ucl", type: :quantitative),
+  Vl.new()
+  |> Vl.data_from_values(series)
+  |> Vl.mark(:line, stroke_dash: [4, 4], color: "#cc6677")
+  |> Vl.encode_field(:x, "w", type: :quantitative)
+  |> Vl.encode_field(:y, "lcl", type: :quantitative),
+  Vl.new()
+  |> Vl.data_from_values(alarms)
+  |> Vl.mark(:point, size: 160, color: "red", filled: true)
+  |> Vl.encode_field(:x, "w", type: :quantitative)
+  |> Vl.encode_field(:y, "avg", type: :quantitative)
+])
+```
+
+## Busy windows get a tighter band
+
+Here is the subtle part the math handles for free. A window that
+averaged 100 readings should sit *much* closer to the true level than
+a window that averaged only 5 — because noise cancels out when you
+average more of it. So the same raw deviation should be treated as
+alarming in a busy window and as nothing in a sparse one.
+
+The band width scales as **sigma / √n** ("sigma divided by the square
+root of the count"). In words: more reports, narrower band. Let's feed
+the *same* 0.6% deviation to two windows — one with 100 reports, one
+with 5 — and see which one trips.
+
+```elixir
+deviation = 0.6
+
+busy = Jump.scan([base_mean + deviation], [base_sigma], 100, baseline: {base_mean, base_sigma})
+sparse = Jump.scan([base_mean + deviation], [base_sigma], 5, baseline: {base_mean, base_sigma})
+
+half_band = fn n -> 3 * base_sigma / :math.sqrt(n) end
+
+Kino.DataTable.new([
+  %{
+    count: 100,
+    half_band: Float.round(half_band.(100), 3),
+    deviation: deviation,
+    flagged: Nx.to_number(busy.jumps[0]) == 1
+  },
+  %{
+    count: 5,
+    half_band: Float.round(half_band.(5), 3),
+    deviation: deviation,
+    flagged: Nx.to_number(sparse.jumps[0]) == 1
+  }
+])
+```
+
+Same 0.6% wobble: **flagged** in the 100-report window (its band is
+only ±0.45 wide), **ignored** in the 5-report window (its band is
+±2.01 wide). The busy window is held to a stricter standard precisely
+because its average is more trustworthy.
+
+The chart below makes the breathing band visible: as the report count
+per window rises and falls, the control limits squeeze in and open out
+around the steady centerline.
+
+```elixir
+:rand.seed(:exsss, {11, 22, 33})
+
+varying_counts = for _ <- 1..40, do: Enum.random([5, 10, 30, 60, 100, 150])
+
+varying =
+  for c <- varying_counts do
+    pts = for _ <- 1..c, do: base_mean + base_sigma * :rand.normal()
+    m = Enum.sum(pts) / c
+    v = Enum.sum(Enum.map(pts, fn x -> (x - m) * (x - m) end)) / (c - 1)
+    %{average: m, std_dev: :math.sqrt(v)}
+  end
+
+v_avgs = Enum.map(varying, & &1.average)
+v_stds = Enum.map(varying, & &1.std_dev)
+v_res = Jump.scan(v_avgs, v_stds, varying_counts, baseline: {base_mean, base_sigma})
+v_ucl = Nx.to_flat_list(v_res.jump_ucl)
+v_lcl = Nx.to_flat_list(v_res.jump_lcl)
+
+v_series =
+  v_avgs
+  |> Enum.with_index()
+  |> Enum.map(fn {a, i} ->
+    %{"w" => i, "avg" => a, "ucl" => Enum.at(v_ucl, i), "lcl" => Enum.at(v_lcl, i),
+      "n" => Enum.at(varying_counts, i)}
+  end)
+
+Vl.new(width: 700, height: 320, title: "Limits breathe with report count (sigma / √n)")
+|> Vl.layers([
+  Vl.new()
+  |> Vl.data_from_values(v_series)
+  |> Vl.mark(:line, interpolate: "step-after", stroke_dash: [4, 4], color: "#cc6677")
+  |> Vl.encode_field(:x, "w", type: :quantitative, title: "window")
+  |> Vl.encode_field(:y, "ucl", type: :quantitative, scale: [zero: false], title: "memory %"),
+  Vl.new()
+  |> Vl.data_from_values(v_series)
+  |> Vl.mark(:line, interpolate: "step-after", stroke_dash: [4, 4], color: "#cc6677")
+  |> Vl.encode_field(:x, "w", type: :quantitative)
+  |> Vl.encode_field(:y, "lcl", type: :quantitative),
+  Vl.new()
+  |> Vl.data_from_values(v_series)
+  |> Vl.mark(:point, filled: true, color: "#4477aa")
+  |> Vl.encode_field(:x, "w", type: :quantitative)
+  |> Vl.encode_field(:y, "avg", type: :quantitative)
+  |> Vl.encode_field(:size, "n", type: :quantitative, title: "reports")
+])
+```
+
+**What to look at:** the dashed limits pinch tight where a window had
+many reports (big dots) and flare wide where it had few (small dots),
+while the averages stay put in the middle.
+
+## The wobble side: when the average lies
+
+Now the second question. Here the device's **average stays flat at
+42%** the whole time — but starting at window 40, the readings inside
+each window get progressively shakier. Story: a network link starts
+flapping, so latency still *averages* the same but bounces harder and
+harder from reading to reading.
+
+`scan` returns a second pair of limits, `wobble_ucl` / `wobble_lcl`,
+that watch the within-window standard deviation directly — the **S
+chart**. This is the part that watches the noise itself, not the level.
+
+```elixir
+:rand.seed(:exsss, {3, 3, 3})
+
+wobble_summaries =
+  for w <- 0..(window_count - 1) do
+    # Average never moves; the spread climbs after window 40.
+    spread = if w >= 40, do: base_sigma * (1.0 + 0.7 * (w - 39) / 20), else: base_sigma
+    pts = for _ <- 1..reports_per_window, do: base_mean + spread * :rand.normal()
+    m = Enum.sum(pts) / reports_per_window
+    v = Enum.sum(Enum.map(pts, fn x -> (x - m) * (x - m) end)) / (reports_per_window - 1)
+    %{average: m, std_dev: :math.sqrt(v)}
+  end
+
+wob_avgs = Enum.map(wobble_summaries, & &1.average)
+wob_stds = Enum.map(wobble_summaries, & &1.std_dev)
+
+wob = Jump.scan(wob_avgs, wob_stds, reports_per_window, baseline: {base_mean, base_sigma})
+
+jump_hits = wob.jumps |> Nx.to_flat_list() |> Enum.sum()
+
+wobble_hits =
+  wob.wobbles
+  |> Nx.to_flat_list()
+  |> Enum.with_index()
+  |> Enum.filter(fn {f, _} -> f == 1 end)
+  |> Enum.map(fn {_, i} -> i end)
+
+%{jump_alarms: jump_hits, wobble_alarms_at: wobble_hits}
+```
+
+The X̄ (jump) chart raises **zero** alarms — the average never left
+its band. The S (wobble) chart lights up starting at **window 47** and
+fires repeatedly through the end as the spread keeps climbing. The two
+charts side by side tell the story: nothing on the left, the failure
+clearly emerging on the right.
+
+**What to look at:** left chart — the average stays flat inside its
+band the whole time. Right chart — the within-window spread climbs out
+the top, with red wobble alarms.
+
+```elixir
+j_ucl = Nx.to_flat_list(wob.jump_ucl)
+j_lcl = Nx.to_flat_list(wob.jump_lcl)
+w_ucl = Nx.to_flat_list(wob.wobble_ucl)
+w_lcl = Nx.to_flat_list(wob.wobble_lcl)
+
+xbar =
+  wob_avgs
+  |> Enum.with_index()
+  |> Enum.map(fn {a, i} ->
+    %{"w" => i, "v" => a, "ucl" => Enum.at(j_ucl, i), "lcl" => Enum.at(j_lcl, i)}
+  end)
+
+schart =
+  wob_stds
+  |> Enum.with_index()
+  |> Enum.map(fn {s, i} ->
+    %{"w" => i, "v" => s, "ucl" => Enum.at(w_ucl, i), "lcl" => Enum.at(w_lcl, i)}
+  end)
+
+s_alarms = Enum.filter(schart, fn row -> row["w"] in wobble_hits end)
+
+chart = fn data, alarm_rows, title, ytitle ->
+  Vl.new(width: 330, height: 280, title: title)
+  |> Vl.layers([
+    Vl.new()
+    |> Vl.data_from_values(data)
+    |> Vl.mark(:line, point: true, color: "#4477aa")
+    |> Vl.encode_field(:x, "w", type: :quantitative, title: "window")
+    |> Vl.encode_field(:y, "v", type: :quantitative, scale: [zero: false], title: ytitle),
+    Vl.new()
+    |> Vl.data_from_values(data)
+    |> Vl.mark(:line, stroke_dash: [4, 4], color: "#cc6677")
+    |> Vl.encode_field(:x, "w", type: :quantitative)
+    |> Vl.encode_field(:y, "ucl", type: :quantitative),
+    Vl.new()
+    |> Vl.data_from_values(data)
+    |> Vl.mark(:line, stroke_dash: [4, 4], color: "#cc6677")
+    |> Vl.encode_field(:x, "w", type: :quantitative)
+    |> Vl.encode_field(:y, "lcl", type: :quantitative),
+    Vl.new()
+    |> Vl.data_from_values(alarm_rows)
+    |> Vl.mark(:point, size: 120, color: "red", filled: true)
+    |> Vl.encode_field(:x, "w", type: :quantitative)
+    |> Vl.encode_field(:y, "v", type: :quantitative)
+  ])
+end
+
+Kino.Layout.grid(
+  [
+    chart.(xbar, [], "X̄ chart (average) — quiet", "average"),
+    chart.(schart, s_alarms, "S chart (spread) — flagging", "std dev")
+  ],
+  columns: 2
+)
+```
+
+This failure mode — steady average, rising spread — is **mathematically
+invisible** to any detector that only watches averages. That is the
+whole reason the S chart exists alongside the X̄ chart.
+
+## A small correction: c4
+
+One honest detail. When you compute a standard deviation from only a
+*few* readings, it systematically comes out a bit **too low** — small
+samples under-report their own spread. The wobble band corrects for
+this with a factor called **c4**, computed here as `(4n−4)/(4n−3)`.
+
+You don't need the derivation. Just notice the shape: c4 is well below
+1 for tiny windows and climbs toward 1 as windows get bigger, where no
+correction is needed.
+
+```elixir
+c4_rows =
+  for n <- [2, 3, 4, 5, 8, 15, 30, 60, 100] do
+    %{"n" => n, "c4" => (n * 4.0 - 4.0) / (n * 4.0 - 3.0)}
+  end
+
+Vl.new(width: 700, height: 260, title: "c4(n): the small-sample correction climbs toward 1")
+|> Vl.data_from_values(c4_rows)
+|> Vl.mark(:line, point: true)
+|> Vl.encode_field(:x, "n", type: :quantitative, title: "reports in window")
+|> Vl.encode_field(:y, "c4", type: :quantitative, scale: [zero: false], title: "c4")
+```
+
+For a 2-report window c4 is **0.80** (the spread reads ~20% low); by
+30 reports it is **0.99**, essentially a no-op. The wobble band
+divides this out so a small busy device isn't constantly mistaken for
+a wobbling one.
+
+## Tune the tripwire
+
+The band width is the `:limit` option, in sigma units (default 3.0).
+Lower it and you catch smaller deviations — but you also start
+flagging healthy noise as false alarms. Move the slider, then re-run
+the two cells below to watch false alarms appear on a stretch of
+**perfectly healthy** data.
+
+```elixir
+limit_input =
+  Kino.Input.range("Tripwire width (sigma)", min: 1.5, max: 4.0, step: 0.1, default: 3.0)
+```
+
+```elixir
+:rand.seed(:exsss, {5, 5, 5})
+
+healthy =
+  for _ <- 1..100 do
+    pts = for _ <- 1..reports_per_window, do: base_mean + base_sigma * :rand.normal()
+    m = Enum.sum(pts) / reports_per_window
+    v = Enum.sum(Enum.map(pts, fn x -> (x - m) * (x - m) end)) / (reports_per_window - 1)
+    %{average: m, std_dev: :math.sqrt(v)}
+  end
+
+h_avgs = Enum.map(healthy, & &1.average)
+h_stds = Enum.map(healthy, & &1.std_dev)
+
+chosen_limit = Kino.Input.read(limit_input)
+
+h_res =
+  Jump.scan(h_avgs, h_stds, reports_per_window,
+    baseline: {base_mean, base_sigma},
+    limit: chosen_limit
+  )
+
+h_ucl = Nx.to_flat_list(h_res.jump_ucl)
+h_lcl = Nx.to_flat_list(h_res.jump_lcl)
+h_flags = Nx.to_flat_list(h_res.jumps)
+false_alarms = Enum.sum(h_flags)
+
+h_series =
+  h_avgs
+  |> Enum.with_index()
+  |> Enum.map(fn {a, i} ->
+    %{"w" => i, "avg" => a, "ucl" => Enum.at(h_ucl, i), "lcl" => Enum.at(h_lcl, i),
+      "flag" => Enum.at(h_flags, i) == 1}
+  end)
+
+h_alarms = Enum.filter(h_series, & &1["flag"])
+
+IO.puts("limit = #{chosen_limit}  →  #{false_alarms} false alarms on 100 healthy windows")
+
+Vl.new(width: 700, height: 320, title: "Healthy data only: false alarms appear as the band tightens")
+|> Vl.layers([
+  Vl.new()
+  |> Vl.data_from_values(h_series)
+  |> Vl.mark(:line, point: true, color: "#4477aa")
+  |> Vl.encode_field(:x, "w", type: :quantitative, title: "window")
+  |> Vl.encode_field(:y, "avg", type: :quantitative, scale: [zero: false], title: "average memory %"),
+  Vl.new()
+  |> Vl.data_from_values(h_series)
+  |> Vl.mark(:line, stroke_dash: [4, 4], color: "#cc6677")
+  |> Vl.encode_field(:x, "w", type: :quantitative)
+  |> Vl.encode_field(:y, "ucl", type: :quantitative),
+  Vl.new()
+  |> Vl.data_from_values(h_series)
+  |> Vl.mark(:line, stroke_dash: [4, 4], color: "#cc6677")
+  |> Vl.encode_field(:x, "w", type: :quantitative)
+  |> Vl.encode_field(:y, "lcl", type: :quantitative),
+  Vl.new()
+  |> Vl.data_from_values(h_alarms)
+  |> Vl.mark(:point, size: 140, color: "red", filled: true)
+  |> Vl.encode_field(:x, "w", type: :quantitative)
+  |> Vl.encode_field(:y, "avg", type: :quantitative)
+])
+```
+
+At the default 3.0 you get about 1 false alarm in 100 windows. Slide
+down to 1.5 and you'll see roughly 7 — the tripwire is now so sensitive
+it trips on ordinary noise. That trade-off is the whole game.
+
+## The blind spot: slow creep
+
+The jump tripwire is built to catch *sudden* trouble. Its blind spot
+is anything **gradual**. A memory leak that adds a sliver per window
+never trips it, because no single window is ever far enough from
+normal — the bad news arrives one harmless-looking step at a time.
+
+Below, memory creeps up by 0.005σ per window over 48 windows (count 50
+each). The end is clearly higher than the start, yet every point stays
+inside the band the entire way.
+
+```elixir
+:rand.seed(:exsss, {2, 2, 2})
+
+creep_windows = 48
+creep_reports = 50
+per_window = 0.005
+
+creep =
+  for w <- 0..(creep_windows - 1) do
+    shift = per_window * base_sigma * w
+    pts = for _ <- 1..creep_reports, do: base_mean + shift + base_sigma * :rand.normal()
+    m = Enum.sum(pts) / creep_reports
+    v = Enum.sum(Enum.map(pts, fn x -> (x - m) * (x - m) end)) / (creep_reports - 1)
+    %{average: m, std_dev: :math.sqrt(v)}
+  end
+
+c_avgs = Enum.map(creep, & &1.average)
+c_stds = Enum.map(creep, & &1.std_dev)
+c_res = Jump.scan(c_avgs, c_stds, creep_reports, baseline: {base_mean, base_sigma})
+
+c_jumps = c_res.jumps |> Nx.to_flat_list() |> Enum.sum()
+total_creep_sigma = per_window * (creep_windows - 1)
+
+%{
+  jump_alarms: c_jumps,
+  total_creep_in_sigma: Float.round(total_creep_sigma, 3),
+  first_avg: Float.round(hd(c_avgs), 2),
+  last_avg: Float.round(List.last(c_avgs), 2)
+}
+```
+
+Zero alarms. The metric drifted up by about a quarter of a sigma over
+the run — visible to the eye, invisible to a per-window tripwire.
+
+**What to look at:** the averages drift upward across the chart, yet
+never cross the band. A tripwire designed for jumps simply cannot see
+this.
+
+```elixir
+c_ucl = Nx.to_flat_list(c_res.jump_ucl)
+c_lcl = Nx.to_flat_list(c_res.jump_lcl)
+
+c_series =
+  c_avgs
+  |> Enum.with_index()
+  |> Enum.map(fn {a, i} ->
+    %{"w" => i, "avg" => a, "ucl" => Enum.at(c_ucl, i), "lcl" => Enum.at(c_lcl, i)}
+  end)
+
+Vl.new(width: 700, height: 320, title: "Slow creep: drifts up the whole way, never trips the band")
+|> Vl.layers([
+  Vl.new()
+  |> Vl.data_from_values(c_series)
+  |> Vl.mark(:line, point: true, color: "#4477aa")
+  |> Vl.encode_field(:x, "w", type: :quantitative, title: "window")
+  |> Vl.encode_field(:y, "avg", type: :quantitative, scale: [zero: false], title: "average memory %"),
+  Vl.new()
+  |> Vl.data_from_values(c_series)
+  |> Vl.mark(:line, stroke_dash: [4, 4], color: "#cc6677")
+  |> Vl.encode_field(:x, "w", type: :quantitative)
+  |> Vl.encode_field(:y, "ucl", type: :quantitative),
+  Vl.new()
+  |> Vl.data_from_values(c_series)
+  |> Vl.mark(:line, stroke_dash: [4, 4], color: "#cc6677")
+  |> Vl.encode_field(:x, "w", type: :quantitative)
+  |> Vl.encode_field(:y, "lcl", type: :quantitative)
+])
+```
+
+## Where to go next
+
+You now have both halves of the jump detector: the **X̄ chart** for
+sudden level changes and the **S chart** for rising wobble, each a
+tripwire calibrated to the device's own noise.
+
+For the gradual trouble this detector can't see, two siblings pick up
+the slack:
+
+* **`02_shift_ewma.livemd`** — `MobiusSmarts.Detect.Shift`, for a
+  metric that moves a moderate amount and *stays* moved.
+* **`03_drift_cusum.livemd`** — `MobiusSmarts.Detect.Drift`, for
+  the slow creep above: small, steady, and "since when?".
+
+Run all three in parallel — big-and-sudden, moderate-and-sustained,
+small-and-slow — and each covers the others' blind spot.

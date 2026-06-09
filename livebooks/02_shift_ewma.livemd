@@ -1,0 +1,428 @@
+# Shift detection — EWMA charts
+
+## The question: a metric that moved and *stayed* moved
+
+You ship a deploy. Latency doesn't spike — nothing pages — but it settles
+a little higher than before and stays there. A week later someone asks
+why the dashboard looks "off." Each individual window looks fine: the new
+level is only about 1.5 standard deviations above where it used to sit,
+and a per-window "3-sigma tripwire" never sees a single point far enough
+out to complain.
+
+A quick vocabulary pass, since the rest of this notebook leans on it:
+
+* **mean** (or **target**) — the average value when things are healthy.
+* **standard deviation** (written **sigma**, σ) — the typical size of the
+  random wiggle around that mean. "1.5σ above target" means "one and a
+  half typical wiggles above where it should be."
+* **variance** — sigma squared; the same idea expressed as a squared
+  quantity, which is what the math actually adds up.
+
+This notebook builds the detector that catches the *sustained moderate
+shift* — the move that's too small to trip a per-window alarm but too
+real to ignore.
+
+```elixir
+Mix.install([
+  {:mobius_smarts, path: Path.expand("..", __DIR__)},
+  {:kino, "~> 0.14"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+```
+
+```elixir
+alias VegaLite, as: Vl
+alias MobiusSmarts.Detect.Shift
+```
+
+## The impression: nudge a fraction of the way each window
+
+The trick is to keep a running **impression** of the metric's level.
+Every new window nudges the impression a fraction `lambda` of the way
+toward the new value:
+
+```
+impression = lambda * new_value + (1 - lambda) * previous_impression
+```
+
+In words: the impression is mostly its old self, with a small splash of
+the latest reading mixed in. Random noise nudges it up and down in equal
+measure, so those nudges cancel and the impression barely moves. This one
+line is the whole idea — it's called an EWMA (exponentially weighted
+moving average). Here it is as a single `Enum.scan` over a noisy but flat
+series.
+
+```elixir
+:rand.seed(:exsss, {1, 2, 3})
+
+target = 50.0
+sigma = 2.0
+lambda = 0.2
+
+flat = for _ <- 1..80, do: target + sigma * :rand.normal()
+
+impression =
+  Enum.scan(flat, target, fn x, prev -> lambda * x + (1.0 - lambda) * prev end)
+
+raw_rows = for {v, i} <- Enum.with_index(flat), do: %{i: i, value: v, series: "raw"}
+
+smoothed_rows =
+  for {v, i} <- Enum.with_index(impression), do: %{i: i, value: v, series: "impression"}
+
+Vl.new(width: 700, height: 300, title: "Noisy flat metric vs. its impression")
+|> Vl.data_from_values(raw_rows ++ smoothed_rows)
+|> Vl.mark(:line)
+|> Vl.encode_field(:x, "i", type: :quantitative, title: "window")
+|> Vl.encode_field(:y, "value", type: :quantitative, scale: [zero: false], title: "latency (ms)")
+|> Vl.encode_field(:color, "series", type: :nominal)
+|> Vl.encode(:opacity, value: 0.9)
+```
+
+Look at the two lines: the faint jagged line is the raw metric, the bold
+flatter line is the impression. The noise is gone but the level — about
+50 — is intact. That bold line is what we'll watch instead of the raw
+data.
+
+## Lambda intuition: how much memory?
+
+`lambda` is the only knob that matters here. It decides how much of each
+new reading mixes in:
+
+* `lambda = 1.0` — keep all of the new value, none of the old. The
+  impression *is* the raw series: no memory at all.
+* small `lambda` (say `0.05`) — keep almost all of the old impression.
+  Long memory, very smooth, slow to react.
+
+Same flat data, four values of `lambda`:
+
+```elixir
+ewma = fn lam ->
+  Enum.scan(flat, target, fn x, prev -> lam * x + (1.0 - lam) * prev end)
+end
+
+lambda_rows =
+  for lam <- [0.05, 0.2, 0.5, 1.0],
+      {v, i} <- Enum.with_index(ewma.(lam)) do
+    %{i: i, value: v, lambda: "λ=#{lam}"}
+  end
+
+Vl.new(width: 700, height: 300, title: "Same data, four lambdas")
+|> Vl.data_from_values(lambda_rows)
+|> Vl.mark(:line)
+|> Vl.encode_field(:x, "i", type: :quantitative, title: "window")
+|> Vl.encode_field(:y, "value", type: :quantitative, scale: [zero: false], title: "latency (ms)")
+|> Vl.encode_field(:color, "lambda", type: :nominal)
+```
+
+The `λ=1.0` line is the raw series exactly — it has no memory, so it's
+just as jagged as the input. As lambda shrinks the line gets smoother and
+lags further behind. The library default is `0.2`: enough memory to erase
+noise, little enough lag to react within a handful of windows.
+
+## The band: how far can the impression wander by chance?
+
+A smooth line is nice, but to *detect* anything we need to know when the
+impression has moved more than chance alone would explain. That's the
+band — an upper and lower control limit (UCL / LCL) around the target.
+
+The clever part: because we know the recipe that built the impression, we
+can compute exactly how far it *can* wander under pure noise at each step.
+The variance of the impression at time `t` is:
+
+```
+Var(z_t) = sigma² · (lambda / (2 - lambda)) · (1 - (1 - lambda)^(2t))
+```
+
+In words: the spread of the impression grows from nearly zero and levels
+off. The `(1 - (1 - lambda)^(2t))` factor is small early — a two-window-
+old impression hasn't had time to wander, so even a small deviation early
+on is meaningful — and climbs to `1` as `t` grows, at which point the
+spread settles to a fixed `sigma² · lambda / (2 - lambda)`. The band is
+just the target plus/minus `L` times the square root of that variance
+(`L = 3` by default, the usual "3-sigma" width).
+
+`Shift.chart/2` computes all of this. Here it is on a healthy series:
+
+```elixir
+:rand.seed(:exsss, {171, 342, 513})
+
+healthy = for _ <- 1..80, do: target + sigma * :rand.normal()
+healthy_chart = Shift.chart(healthy, target: target, sigma: sigma)
+
+hs = Nx.to_flat_list(healthy_chart.smoothed)
+hu = Nx.to_flat_list(healthy_chart.ucl)
+hl = Nx.to_flat_list(healthy_chart.lcl)
+
+# Half-width grows from narrow to a fixed value:
+IO.inspect(Float.round(Enum.at(hu, 0) - target, 3), label: "half-width at t=1")
+IO.inspect(Float.round(Enum.at(hu, 1) - target, 3), label: "half-width at t=2")
+IO.inspect(Float.round(List.last(hu) - target, 3), label: "half-width at t=80")
+
+band_rows =
+  for i <- 0..(length(hs) - 1) do
+    %{i: i, impression: Enum.at(hs, i), ucl: Enum.at(hu, i), lcl: Enum.at(hl, i)}
+  end
+
+Vl.new(width: 700, height: 300, title: "Healthy series with its time-varying band")
+|> Vl.data_from_values(band_rows)
+|> Vl.layers([
+  Vl.new()
+  |> Vl.mark(:line, color: "#888")
+  |> Vl.encode_field(:x, "i", type: :quantitative, title: "window")
+  |> Vl.encode_field(:y, "ucl", type: :quantitative, scale: [zero: false]),
+  Vl.new()
+  |> Vl.mark(:line, color: "#888")
+  |> Vl.encode_field(:x, "i")
+  |> Vl.encode_field(:y, "lcl", type: :quantitative),
+  Vl.new()
+  |> Vl.mark(:line, color: "#1f77b4")
+  |> Vl.encode_field(:x, "i")
+  |> Vl.encode_field(:y, "impression", type: :quantitative, title: "latency (ms)")
+])
+```
+
+Look at the grey lines: the band starts narrow (half-width about 1.2 at
+the first window) and flares open to its fixed width of 2.0 within a dozen
+windows. The blue impression stays comfortably inside — this series is
+healthy, so nothing fires.
+
+## The payoff: a sustained 1.5σ shift
+
+Now the deploy story. The metric runs at target for 40 windows, then a
+deploy bumps it up by 1.5σ (3 ms) and it *stays* there. First, the naive
+per-window check that fails in the intro: is any single window more than
+3σ from target?
+
+```elixir
+shift_at = 40
+shift_size_sigma = 1.5
+
+:rand.seed(:exsss, {171, 342, 513})
+
+shifted =
+  for i <- 0..79 do
+    base = if i >= shift_at, do: target + shift_size_sigma * sigma, else: target
+    base + sigma * :rand.normal()
+  end
+
+# Naive 3-sigma per-window tripwire:
+naive_alarms =
+  shifted
+  |> Enum.with_index()
+  |> Enum.filter(fn {v, _i} -> abs(v - target) > 3 * sigma end)
+
+IO.inspect(length(naive_alarms), label: "per-window 3σ alarms (whole series)")
+```
+
+Zero. The shift is real and sustained, but no single window pokes far
+enough out for a per-window tripwire to notice. Now the EWMA chart on the
+exact same data:
+
+```elixir
+shift_chart = Shift.chart(shifted, target: target, sigma: sigma)
+
+IO.inspect(shift_chart.first_violation, label: "first_violation index")
+IO.inspect(shift_chart.first_violation - shift_at, label: "windows after the shift")
+
+ss = Nx.to_flat_list(shift_chart.smoothed)
+su = Nx.to_flat_list(shift_chart.ucl)
+sl = Nx.to_flat_list(shift_chart.lcl)
+sv = Nx.to_flat_list(shift_chart.violations)
+
+base_rows =
+  for i <- 0..(length(ss) - 1) do
+    %{i: i, impression: Enum.at(ss, i), ucl: Enum.at(su, i), lcl: Enum.at(sl, i)}
+  end
+
+violation_rows =
+  for {1, i} <- Enum.zip(sv, 0..(length(sv) - 1)), do: %{i: i, value: Enum.at(ss, i)}
+
+fv_rows = [%{i: shift_chart.first_violation}]
+
+Vl.new(width: 700, height: 340, title: "Sustained 1.5σ shift caught by the EWMA chart")
+|> Vl.layers([
+  Vl.new()
+  |> Vl.data_from_values(base_rows)
+  |> Vl.mark(:line, color: "#888")
+  |> Vl.encode_field(:x, "i", type: :quantitative, title: "window")
+  |> Vl.encode_field(:y, "ucl", type: :quantitative, scale: [zero: false]),
+  Vl.new()
+  |> Vl.data_from_values(base_rows)
+  |> Vl.mark(:line, color: "#888")
+  |> Vl.encode_field(:x, "i")
+  |> Vl.encode_field(:y, "lcl", type: :quantitative),
+  Vl.new()
+  |> Vl.data_from_values(base_rows)
+  |> Vl.mark(:line, color: "#1f77b4")
+  |> Vl.encode_field(:x, "i")
+  |> Vl.encode_field(:y, "impression", type: :quantitative, title: "latency (ms)"),
+  Vl.new()
+  |> Vl.data_from_values(violation_rows)
+  |> Vl.mark(:point, color: "#d62728", filled: true, size: 45)
+  |> Vl.encode_field(:x, "i")
+  |> Vl.encode_field(:y, "value", type: :quantitative),
+  Vl.new()
+  |> Vl.data_from_values(fv_rows)
+  |> Vl.mark(:rule, color: "#d62728", stroke_dash: [4, 4])
+  |> Vl.encode_field(:x, "i", type: :quantitative)
+])
+```
+
+Look at where the blue impression line crosses the upper grey band: the
+red dashed rule marks `first_violation` at window 42 — just 2 windows
+after the shift landed at window 40. The red dots are every window the
+impression sits outside the band. The per-window check saw nothing; the
+impression was dragged steadily off target and tripped the band almost
+immediately.
+
+## The tradeoff: detection delay vs. shift size
+
+Smaller `lambda` smooths harder and can catch smaller shifts, but it
+reacts later. Bigger shifts are caught faster. Move the sliders, then
+re-run the two cells below to see the delay change. The defaults reproduce
+the case above (lambda 0.2, shift 1.5σ).
+
+```elixir
+lambda_input = Kino.Input.range("lambda", min: 0.05, max: 1.0, step: 0.05, default: 0.2)
+```
+
+```elixir
+shift_input = Kino.Input.range("shift size (sigma)", min: 0.5, max: 3.0, step: 0.5, default: 1.5)
+```
+
+```elixir
+chosen_lambda = Kino.Input.read(lambda_input)
+chosen_shift = Kino.Input.read(shift_input)
+
+:rand.seed(:exsss, {171, 342, 513})
+
+tuned_series =
+  for i <- 0..79 do
+    base = if i >= shift_at, do: target + chosen_shift * sigma, else: target
+    base + sigma * :rand.normal()
+  end
+
+tuned = Shift.chart(tuned_series, target: target, sigma: sigma, lambda: chosen_lambda)
+
+delay =
+  case tuned.first_violation do
+    nil -> "never detected"
+    fv -> "#{fv - shift_at} windows after the shift"
+  end
+
+Kino.DataTable.new([
+  %{lambda: chosen_lambda, shift_sigma: chosen_shift, first_violation: tuned.first_violation, delay: delay}
+])
+```
+
+Try `lambda = 1.0` (no memory) with the default 1.5σ shift: it reports
+"never detected" — with no memory the impression is just the raw series,
+and we already saw the raw series never trips a 3σ band. Now drop the
+shift to 0.5σ at `lambda = 0.2`: also never detected, because half a sigma
+is buried in the noise. Small lambda plus a real sustained shift is the
+sweet spot.
+
+## Bonus: the impression is your dashboard line
+
+There's a free win in all of this. The impression isn't only a detector
+input — it's the natural line to *draw on a dashboard*. It's the raw
+metric with the noise taken out, so a human glancing at it sees the level
+and the trend without the jitter. The bold line in the very first chart
+was already a better dashboard than the raw data underneath it.
+
+## Streaming form: one value at a time
+
+In production you don't have the whole series — values arrive one window
+at a time. `Shift.new/1` and `Shift.step/2` carry the impression forward
+with O(1) state per metric (just the current impression and a step
+counter), so it fits comfortably on a device. Here we replay the shifted
+series through the streaming API and print the step where the status first
+turns non-`:ok`.
+
+```elixir
+state0 = Shift.new(target: target, sigma: sigma)
+
+{first_streaming_violation, _final_state} =
+  shifted
+  |> Enum.with_index()
+  |> Enum.reduce({nil, state0}, fn {x, idx}, {found, state} ->
+    {status, next_state} = Shift.step(state, x)
+    found = if found == nil and status != :ok, do: {idx, status}, else: found
+    {found, next_state}
+  end)
+
+IO.inspect(first_streaming_violation, label: "{step, status} of first streaming violation")
+```
+
+It reports `{42, :upper_violation}` — the same window 42 the batch
+`chart/2` found, reached by folding one value at a time instead of looking
+at the whole series at once.
+
+## Blind spots: where Shift hands off to its siblings
+
+Shift sits in the middle of a size/speed gradient. It deliberately
+ignores two things its siblings catch.
+
+**A single huge spike barely moves the impression.** Because each window
+only contributes a fraction `lambda`, one freak reading gets diluted. Here
+a healthy series gets one 4σ spike at window 40 — a value of 58 ms, which
+a per-window check flags loudly:
+
+```elixir
+:rand.seed(:exsss, {7, 14, 21})
+
+healthy2 = for _ <- 1..80, do: target + sigma * :rand.normal()
+spike_idx = 40
+spiked = List.update_at(healthy2, spike_idx, fn _ -> target + 4.0 * sigma end)
+
+raw_spike_alarms = Enum.count(spiked, fn v -> abs(v - target) > 3 * sigma end)
+spike_chart = Shift.chart(spiked, target: target, sigma: sigma)
+sp = Nx.to_flat_list(spike_chart.smoothed)
+
+IO.inspect(Enum.at(spiked, spike_idx), label: "raw value at the spike (ms)")
+IO.inspect(raw_spike_alarms, label: "per-window 3σ alarms")
+IO.inspect(Float.round(Enum.at(sp, spike_idx) - target, 2), label: "impression rise at the spike")
+IO.inspect(spike_chart.first_violation, label: "EWMA first_violation")
+```
+
+The raw value hits 58 ms (4σ out) and a per-window tripwire fires once.
+But the impression only lifts about 1.33 ms — well inside its band of 2.0
+— so `Shift.chart` returns `nil`: no violation. That's by design. A
+one-window spike is `MobiusSmarts.Detect.Jump`'s job (Shewhart chart,
+no memory, full reaction to single points) — see
+`01_jump_shewhart_charts.livemd`.
+
+```elixir
+spike_rows = for {v, i} <- Enum.with_index(spiked), do: %{i: i, value: v, series: "raw"}
+
+impression_rows =
+  for {v, i} <- Enum.with_index(sp), do: %{i: i, value: v, series: "impression"}
+
+band_only = for i <- 0..79, do: %{i: i, ucl: Enum.at(Nx.to_flat_list(spike_chart.ucl), i)}
+
+Vl.new(width: 700, height: 300, title: "A 4σ spike: loud in the raw line, a shrug in the impression")
+|> Vl.layers([
+  Vl.new()
+  |> Vl.data_from_values(spike_rows ++ impression_rows)
+  |> Vl.mark(:line)
+  |> Vl.encode_field(:x, "i", type: :quantitative, title: "window")
+  |> Vl.encode_field(:y, "value", type: :quantitative, scale: [zero: false], title: "latency (ms)")
+  |> Vl.encode_field(:color, "series", type: :nominal),
+  Vl.new()
+  |> Vl.data_from_values(band_only)
+  |> Vl.mark(:line, color: "#888", stroke_dash: [4, 4])
+  |> Vl.encode_field(:x, "i")
+  |> Vl.encode_field(:y, "ucl", type: :quantitative)
+])
+```
+
+Look at window 40: the raw line leaps to the top of the chart while the
+impression only ticks up and stays under the dashed band, then settles
+right back. One spike isn't a shift.
+
+**A very tiny slow drift takes ages.** At the other end, a creep of a
+fraction of a sigma over many windows nudges the impression so gently it
+may never clear the band. That's `MobiusSmarts.Detect.Drift`'s job
+(CUSUM, full memory — it *accumulates* tiny deviations instead of
+discounting them) — see `03_drift_cusum.livemd`. Run all three in
+parallel and each covers the others' blind spot.

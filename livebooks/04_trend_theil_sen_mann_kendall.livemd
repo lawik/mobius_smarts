@@ -1,0 +1,528 @@
+# Trend detection — Theil–Sen and Mann–Kendall
+
+```elixir
+Mix.install([
+  {:mobius_smarts, path: Path.expand("..", __DIR__)},
+  {:kino, "~> 0.14"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+```
+
+```elixir
+alias VegaLite, as: Vl
+alias MobiusSmarts.Detect.Trend
+```
+
+## Four questions a sysadmin actually asks
+
+Your device has been logging disk usage, tmpfs, battery — the usual suspects.
+A number is drifting. Before you page anyone, four things matter:
+
+1. **Direction** — is it going up or down?
+2. **Speed** — how fast, in real units (% per hour)?
+3. **Is it real, or luck?** — noise wiggles; is this an actual heading?
+4. **ETA** — at this rate, when does it cross the wall (disk 95% full, battery 5%)?
+
+The payoff is a sentence like *"tmpfs full in ~9 days"*. That is worth a hundred
+anomaly scores, because it tells you both that something is wrong *and* how long
+you have to fix it.
+
+This notebook builds the two tools that answer those questions:
+**Theil–Sen** (direction + speed, glitch-proof) and **Mann–Kendall** (is it real).
+The sibling detectors in `MobiusSmarts.Detect` handle *sudden* and *sustained*
+level changes (notebooks 01–03); `Trend` is for the slow, monotonic march toward
+a wall.
+
+## The villain: the line everyone reaches for
+
+When asked "how fast is it climbing", almost everyone fits a straight line by
+**ordinary least squares** (OLS) — the line that minimizes the sum of *squared*
+vertical distances to the points. Squaring is the problem: a point twice as far
+away pulls four times as hard. One reboot spike and the line lurches to chase it.
+
+Here is a tidy 10-point series climbing about 1.5%/window, with two reboot
+spikes jammed in (the device briefly reported 95% and 98%).
+
+```elixir
+:rand.seed(:exsss, {1, 2, 3})
+
+n = 10
+
+clean =
+  Enum.map(0..(n - 1), fn i -> 40.0 + 1.5 * i + (:rand.uniform() - 0.5) * 2.0 end)
+
+spiked =
+  clean
+  |> List.update_at(3, fn _ -> 95.0 end)
+  |> List.update_at(7, fn _ -> 98.0 end)
+
+Enum.map(spiked, &Float.round(&1, 1))
+```
+
+We fit OLS by hand so there is no black box: slope = covariance(x, y) / variance(x),
+i.e. how much x and y move together divided by how much x moves on its own.
+
+```elixir
+xs = Enum.map(0..(n - 1), &(&1 * 1.0))
+mean_x = Enum.sum(xs) / n
+
+ols = fn ys ->
+  mean_y = Enum.sum(ys) / n
+  num = Enum.zip(xs, ys) |> Enum.map(fn {x, y} -> (x - mean_x) * (y - mean_y) end) |> Enum.sum()
+  den = Enum.map(xs, fn x -> (x - mean_x) * (x - mean_x) end) |> Enum.sum()
+  slope = num / den
+  %{slope: slope, intercept: mean_y - slope * mean_x}
+end
+
+%{slope: ols_slope, intercept: ols_int} = ols.(spiked)
+{Float.round(ols_slope, 3), Float.round(ols_int, 3)}
+```
+
+The true climb is about 1.5%/window, but OLS reports a slope of ~1.98 — about a
+third too steep. The two spikes have dragged the whole line upward. Watch the
+fitted line tilt to split the difference toward those two stray points.
+
+```elixir
+ols_line_pts =
+  Enum.map(xs, fn x -> %{"i" => x, "value" => ols_slope * x + ols_int, "kind" => "OLS fit"} end)
+
+data_pts = Enum.map(0..(n - 1), fn i -> %{"i" => i * 1.0, "value" => Enum.at(spiked, i)} end)
+
+Vl.new(width: 700, height: 320, title: "OLS chases the two reboot spikes")
+|> Vl.layers([
+  Vl.new()
+  |> Vl.data_from_values(data_pts)
+  |> Vl.mark(:circle, size: 90, color: "#555")
+  |> Vl.encode_field(:x, "i", type: :quantitative, title: "window")
+  |> Vl.encode_field(:y, "value", type: :quantitative, title: "% used"),
+  Vl.new()
+  |> Vl.data_from_values(ols_line_pts)
+  |> Vl.mark(:line, color: "#d62728", stroke_width: 2)
+  |> Vl.encode_field(:x, "i", type: :quantitative)
+  |> Vl.encode_field(:y, "value", type: :quantitative)
+])
+```
+
+The red line leans toward the two spikes near the top instead of tracking the
+rising body of points below them.
+
+## The trick: a line through *every pair* of points
+
+Theil–Sen throws away the squaring entirely. For every pair of points it draws
+the line connecting them and records that slope. With 10 points that is
+10·9/2 = 45 slopes. Then it takes the **median** — sort all 45 slopes and pick
+the middle one.
+
+A median is immovable by outliers: pushing one value out to infinity only shifts
+*which* value sits in the middle by one position, never to the extremes. The two
+spikes do produce a handful of insane pairwise slopes, but those land out at the
+fringes of the sorted list, far from the middle. Up to ~29% of the points can be
+pure garbage before the median slope budges — that is the documented breakdown
+point of the estimator.
+
+Let's compute all 45 slopes inline and look at where they pile up.
+
+```elixir
+pairwise_slopes =
+  for i <- 0..(n - 2), j <- (i + 1)..(n - 1) do
+    (Enum.at(spiked, j) - Enum.at(spiked, i)) / (j - i)
+  end
+
+sorted = Enum.sort(pairwise_slopes)
+m = length(pairwise_slopes)
+median_slope = (Enum.at(sorted, div(m - 1, 2)) + Enum.at(sorted, div(m, 2))) / 2.0
+
+%{
+  count: m,
+  min: Float.round(Enum.min(pairwise_slopes), 2),
+  max: Float.round(Enum.max(pairwise_slopes), 2),
+  median: Float.round(median_slope, 3)
+}
+```
+
+The slopes range from about -49 to +52 — those wild extremes are spike-to-point
+pairs. But the **median is ~1.46**, right back near the true 1.5. The histogram
+below shows why: a dense cluster sits near 1.5, and the spike-driven slopes are
+just lonely outliers in the tails that the median ignores.
+
+```elixir
+hist_pts = Enum.map(pairwise_slopes, fn s -> %{"slope" => s} end)
+
+Vl.new(width: 700, height: 280, title: "All 45 pairwise slopes — the median sits in the dense middle")
+|> Vl.layers([
+  Vl.new()
+  |> Vl.data_from_values(hist_pts)
+  |> Vl.mark(:bar, color: "#4c78a8")
+  |> Vl.encode_field(:x, "slope", type: :quantitative, bin: [maxbins: 40], title: "pairwise slope")
+  |> Vl.encode(:y, aggregate: :count, title: "count"),
+  Vl.new()
+  |> Vl.data_from_values([%{"slope" => median_slope}])
+  |> Vl.mark(:rule, color: "#d62728", stroke_width: 3)
+  |> Vl.encode_field(:x, "slope", type: :quantitative)
+])
+```
+
+The fat bar near zero-to-a-few is the honest signal; the red rule marks the median.
+The scattered single-count bars far left and right are the spikes — outvoted.
+
+## Side by side: OLS line vs Theil–Sen line
+
+Now the real library function. `Trend.theil_sen/1` returns `%{slope:, intercept:}`,
+where `slope * window + intercept` predicts the series. Same spiky data, two lines.
+
+```elixir
+ts = Trend.theil_sen(spiked)
+{Float.round(ts.slope, 3), Float.round(ts.intercept, 3)}
+```
+
+```elixir
+ts_line_pts =
+  Enum.map(xs, fn x ->
+    %{"i" => x, "value" => ts.slope * x + ts.intercept}
+  end)
+
+ols_only = Vl.new(width: 340, height: 280, title: "OLS — dragged up to 1.98/win")
+
+ols_only =
+  Vl.layers(ols_only, [
+    Vl.new()
+    |> Vl.data_from_values(data_pts)
+    |> Vl.mark(:circle, size: 70, color: "#555")
+    |> Vl.encode_field(:x, "i", type: :quantitative, title: "window")
+    |> Vl.encode_field(:y, "value", type: :quantitative, title: "% used"),
+    Vl.new()
+    |> Vl.data_from_values(ols_line_pts)
+    |> Vl.mark(:line, color: "#d62728", stroke_width: 2)
+    |> Vl.encode_field(:x, "i", type: :quantitative)
+    |> Vl.encode_field(:y, "value", type: :quantitative)
+  ])
+
+ts_only = Vl.new(width: 340, height: 280, title: "Theil–Sen — holds at 1.46/win")
+
+ts_only =
+  Vl.layers(ts_only, [
+    Vl.new()
+    |> Vl.data_from_values(data_pts)
+    |> Vl.mark(:circle, size: 70, color: "#555")
+    |> Vl.encode_field(:x, "i", type: :quantitative, title: "window")
+    |> Vl.encode_field(:y, "value", type: :quantitative, title: "% used"),
+    Vl.new()
+    |> Vl.data_from_values(ts_line_pts)
+    |> Vl.mark(:line, color: "#2ca02c", stroke_width: 2)
+    |> Vl.encode_field(:x, "i", type: :quantitative)
+    |> Vl.encode_field(:y, "value", type: :quantitative)
+  ])
+
+Kino.Layout.grid([ols_only, ts_only], columns: 2)
+```
+
+The red line (left) splits the difference toward the spikes; the green line
+(right) threads the honest body of points and ignores them.
+
+## Tune it: more spikes, bigger spikes
+
+Set the number of reboot spikes and how high they jump, then **re-run the cell
+below the inputs**. Watch the Theil–Sen slope barely move while OLS swings.
+
+```elixir
+num_outliers_input =
+  Kino.Input.range("Number of reboot spikes", min: 0, max: 3, step: 1, default: 2)
+
+magnitude_input =
+  Kino.Input.range("Spike magnitude (% value)", min: 80, max: 100, step: 1, default: 96)
+
+Kino.Layout.grid([num_outliers_input, magnitude_input], columns: 2)
+```
+
+```elixir
+num_outliers = trunc(Kino.Input.read(num_outliers_input))
+magnitude = Kino.Input.read(magnitude_input) * 1.0
+
+# Inject the chosen number of spikes at fixed positions for reproducibility.
+spike_positions = [3, 7, 5]
+
+tuned =
+  spike_positions
+  |> Enum.take(num_outliers)
+  |> Enum.reduce(clean, fn pos, acc -> List.update_at(acc, pos, fn _ -> magnitude end) end)
+
+%{slope: tuned_ols} = ols.(tuned)
+tuned_ts = Trend.theil_sen(tuned)
+
+%{
+  spikes: num_outliers,
+  ols_slope: Float.round(tuned_ols, 3),
+  theil_sen_slope: Float.round(tuned_ts.slope, 3),
+  truth_is_about: 1.5
+}
+```
+
+With the defaults (2 spikes at 96%), OLS reads well above 1.5 while Theil–Sen
+stays near 1.46. Drag spikes to 0 and the two agree; add spikes and OLS runs away
+while Theil–Sen holds. That stubbornness *is* the feature.
+
+## Is it real, or luck? Mann–Kendall
+
+A slope answers "how fast" but not "should I trust it". A series of pure noise has
+*some* slope too. Mann–Kendall asks a question that does not care about magnitudes
+at all: **of every pair of points, how many go up over time versus down?**
+
+For each pair `(i, j)` with `j` later than `i`, score +1 if the value rose, -1 if
+it fell. Sum them into **S**. A genuine uptrend makes almost every pair score +1,
+so S is large and positive. Pure noise is a coin flip, so ups and downs nearly
+cancel and S sits near zero.
+
+Tiny worked example, 6 points:
+
+```elixir
+tiny = [12.0, 14.0, 13.0, 16.0, 18.0, 17.0]
+tn = length(tiny)
+
+pair_rows =
+  for i <- 0..(tn - 2), j <- (i + 1)..(tn - 1) do
+    a = Enum.at(tiny, i)
+    b = Enum.at(tiny, j)
+    sign = cond do
+      b > a -> 1
+      b < a -> -1
+      true -> 0
+    end
+    %{"from i" => i, "to j" => j, "v_i" => a, "v_j" => b, "sign" => sign}
+  end
+
+Kino.DataTable.new(pair_rows)
+```
+
+```elixir
+ups = Enum.count(pair_rows, &(&1["sign"] == 1))
+downs = Enum.count(pair_rows, &(&1["sign"] == -1))
+%{ups: ups, downs: downs, s: ups - downs}
+```
+
+13 pairs go up, 2 go down, so S = 11 out of 15 possible. Strongly upward — but
+6 points is very little evidence. To turn S into a yes/no we need to know what S
+looks like *when nothing is going on*.
+
+### The null hypothesis, by brute force
+
+The "null hypothesis" is the boring world: no trend, just noise. We simulate it.
+Generate ~2,000 pure-noise series of length 20, compute S for each, and histogram
+those S values. That spread is what luck alone produces.
+
+```elixir
+:rand.seed(:exsss, {1, 2, 3})
+len = 20
+
+mk_s = fn ys ->
+  k = length(ys)
+  for i <- 0..(k - 2), j <- (i + 1)..(k - 1), reduce: 0 do
+    acc ->
+      a = Enum.at(ys, i)
+      b = Enum.at(ys, j)
+      acc + cond do
+        b > a -> 1
+        b < a -> -1
+        true -> 0
+      end
+  end
+end
+
+null_s =
+  for _ <- 1..2000 do
+    noise = Enum.map(1..len, fn _ -> :rand.normal() end)
+    mk_s.(noise)
+  end
+
+# A genuinely trending series of the same length: gentle climb buried in noise.
+trending = Enum.map(0..(len - 1), fn i -> 50.0 + 0.8 * i + :rand.normal() * 3.0 end)
+observed_s = mk_s.(trending)
+
+frac_as_extreme = Enum.count(null_s, &(abs(&1) >= abs(observed_s))) / length(null_s)
+
+%{
+  null_s_range: {Enum.min(null_s), Enum.max(null_s)},
+  observed_s: observed_s,
+  fraction_of_luck_worlds_at_least_this_extreme: frac_as_extreme
+}
+```
+
+The noise S values cluster around 0 and rarely stray past ±90. Our trending
+series scores S = 124 — off the chart. Not one of the 2,000 luck-worlds reached
+it, so the fraction is 0. That fraction is exactly the **p-value**: the share of
+pure-luck worlds that produce an imbalance at least this extreme. Tiny p = "luck
+basically never does this" = the trend is real.
+
+```elixir
+null_pts = Enum.map(null_s, fn s -> %{"S" => s} end)
+
+Vl.new(width: 700, height: 300, title: "Distribution of S under pure noise — observed S is way out in the tail")
+|> Vl.layers([
+  Vl.new()
+  |> Vl.data_from_values(null_pts)
+  |> Vl.mark(:bar, color: "#9ecae1")
+  |> Vl.encode_field(:x, "S", type: :quantitative, bin: [maxbins: 50], title: "S statistic (no-trend worlds)")
+  |> Vl.encode(:y, aggregate: :count, title: "count"),
+  Vl.new()
+  |> Vl.data_from_values([%{"S" => observed_s}])
+  |> Vl.mark(:rule, color: "#d62728", stroke_width: 3)
+  |> Vl.encode_field(:x, "S", type: :quantitative)
+])
+```
+
+The blue hill is luck; the red rule is the real trend, sitting far outside the
+hill where luck never reaches.
+
+The library does this analytically instead of by simulation — it knows the
+variance of S under the null and converts to a **z score** (how many standard
+deviations from zero) and a p-value:
+
+```elixir
+Trend.mann_kendall(trending)
+```
+
+z ≈ 3.99, p ≈ 6.6e-5, verdict `:increasing`. The analytic p matches the picture:
+extraordinarily unlikely by chance. And because Mann–Kendall only ever looks at
+the *order* of points, never their size, the same reboot spikes that fooled OLS
+cannot fool it either.
+
+## ETA: when does the disk fill?
+
+Now the headline. A real device-health series: disk % over 48 hours, sampled
+hourly with real UNIX timestamps, climbing about 0.42%/hour through noise — plus
+one reboot that briefly reported 3% and one glitch that reported 99%.
+
+```elixir
+:rand.seed(:exsss, {1, 2, 3})
+
+t0 = 1_733_400_000
+hours = 0..47
+disk_ts = Enum.map(hours, fn h -> t0 + h * 3600 end)
+
+disk =
+  hours
+  |> Enum.map(fn h -> 55.0 + 0.42 * h + :rand.normal() * 1.2 end)
+  |> List.update_at(12, fn _ -> 3.0 end)
+  |> List.update_at(33, fn _ -> 99.0 end)
+
+%{last_value: Float.round(List.last(disk), 1), points: length(disk)}
+```
+
+Passing real timestamps makes the slope **per second**; multiply by 3600 for
+per-hour. Theil–Sen shrugs off both glitches; OLS does not.
+
+```elixir
+disk_ts_fit = Trend.theil_sen(disk, disk_ts)
+ts_per_hour = disk_ts_fit.slope * 3600
+
+# OLS slope per hour (hour index as x) for contrast.
+hx = Enum.map(hours, &(&1 * 1.0))
+%{slope: ols_per_hour} = (fn ->
+  mh = Enum.sum(hx) / 48
+  mv = Enum.sum(disk) / 48
+  num = Enum.zip(hx, disk) |> Enum.map(fn {x, y} -> (x - mh) * (y - mv) end) |> Enum.sum()
+  den = Enum.map(hx, fn x -> (x - mh) * (x - mh) end) |> Enum.sum()
+  slope = num / den
+  %{slope: slope, intercept: mv - slope * mh}
+end).()
+
+%{theil_sen_per_hour: Float.round(ts_per_hour, 3), ols_per_hour: Float.round(ols_per_hour, 3)}
+```
+
+Theil–Sen reads ~0.42%/hour — the honest rate. OLS reads ~0.52%/hour, inflated by
+the lone 99% glitch. Now `eta_to_threshold/3`: it takes the robust slope, measures
+the gap from the latest value to the ceiling, and projects forward.
+
+```elixir
+threshold = 95.0
+eta_result = Trend.eta_to_threshold(disk, disk_ts, threshold)
+
+eta_human =
+  case eta_result do
+    {:eta, secs} -> "~#{round(secs / 3600)} hours  (~#{Float.round(secs / 86_400, 1)} days)"
+    :not_approaching -> "not approaching"
+  end
+
+%{raw: eta_result, human: eta_human}
+```
+
+ETA ≈ 50 hours, about 2.1 days, until disk hits 95%. That is the actionable
+sentence: *"disk full in ~2 days"*. Let's draw it — data, the Theil–Sen line
+extended to the crossing, the 95% ceiling, and the crossing point marked.
+
+```elixir
+{:eta, eta_secs} = eta_result
+cross_ts = List.last(disk_ts) + eta_secs
+
+# Convert timestamps to hours-from-start for readable axes.
+to_h = fn t -> (t - t0) / 3600 end
+
+disk_points =
+  Enum.map(0..47, fn i -> %{"hour" => i * 1.0, "value" => Enum.at(disk, i)} end)
+
+# Theil–Sen line from start out past the crossing.
+line_end_h = to_h.(cross_ts)
+
+ts_line =
+  Enum.map([0.0, line_end_h], fn h ->
+    t = t0 + h * 3600
+    %{"hour" => h, "value" => disk_ts_fit.slope * t + disk_ts_fit.intercept}
+  end)
+
+crossing = [%{"hour" => line_end_h, "value" => threshold}]
+
+Vl.new(width: 700, height: 360, title: "Disk filling — Theil–Sen projected to the 95% wall")
+|> Vl.layers([
+  Vl.new()
+  |> Vl.data_from_values(disk_points)
+  |> Vl.mark(:circle, size: 55, color: "#555", opacity: 0.7)
+  |> Vl.encode_field(:x, "hour", type: :quantitative, title: "hours from start")
+  |> Vl.encode_field(:y, "value", type: :quantitative, title: "% used", scale: [domain: [0, 100]]),
+  Vl.new()
+  |> Vl.data_from_values(ts_line)
+  |> Vl.mark(:line, color: "#2ca02c", stroke_width: 2)
+  |> Vl.encode_field(:x, "hour", type: :quantitative)
+  |> Vl.encode_field(:y, "value", type: :quantitative),
+  Vl.new()
+  |> Vl.data_from_values([%{"y" => threshold}])
+  |> Vl.mark(:rule, color: "#d62728", stroke_dash: [6, 4])
+  |> Vl.encode_field(:y, "y", type: :quantitative),
+  Vl.new()
+  |> Vl.data_from_values(crossing)
+  |> Vl.mark(:point, size: 220, color: "#d62728", filled: true, shape: "triangle-up")
+  |> Vl.encode_field(:x, "hour", type: :quantitative)
+  |> Vl.encode_field(:y, "value", type: :quantitative)
+])
+```
+
+Follow the green line up-and-right until it touches the dashed red ceiling — the
+red triangle marks the crossing, ~50 hours past the last sample. The two glitch
+points sit far off the line and do not bend it.
+
+### The other answer: not approaching
+
+If the metric is flat or moving *away* from the wall, projecting a crossing is
+nonsense, and `eta_to_threshold/3` says so. A draining-not-filling disk:
+
+```elixir
+declining = Enum.map(hours, fn h -> 80.0 - 0.5 * h + :rand.normal() end)
+Trend.eta_to_threshold(declining, disk_ts, 95.0)
+```
+
+`:not_approaching` — the series is heading down, away from the 95% ceiling, so
+there is no ETA to give. (The same answer comes back for a flat series.)
+
+## Caveats and where this fits
+
+- **Cost is O(n²).** Both estimators build the full pairwise matrix — every pair
+  of points. At Mobius RRD scale (hundreds to ~2,000 windows) that is fine; for
+  n = 1000 the matrices are a few MB and vectorized. Do **not** point this at a
+  raw 1 Hz stream — aggregate into windows first.
+- **Theil–Sen tolerates ~29% garbage** before the slope moves, which is why reboot
+  spikes and sensor glitches pass through harmlessly.
+- **Mann–Kendall ignores magnitude**, only order, so spikes cannot inflate its
+  verdict either — but that also means it tells you *whether*, not *how fast*.
+  Use them together: Mann–Kendall to confirm the trend is real, Theil–Sen for the
+  rate, `eta_to_threshold` for the deadline.
+- **This is the slow-march detector.** For a value that *suddenly jumps* or
+  *steps and stays*, reach for `Detect.Jump` / `Detect.Shift` / `Detect.Drift`
+  (notebooks 01–03). `Trend` is for the monotonic creep toward a wall.

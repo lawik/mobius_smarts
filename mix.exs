@@ -1,17 +1,18 @@
-defmodule MobiusProcessing.MixProject do
+defmodule MobiusSmarts.MixProject do
   use Mix.Project
 
   def project do
     [
-      app: :mobius_processing,
+      app: :mobius_smarts,
       version: "0.1.0",
       elixir: "~> 1.19",
+      elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       deps: deps(),
-      name: "Mobius processing",
+      name: "Mobius smarts",
       description:
-        "Bridge between Mobius metric storage and the Nx ecosystem: " <>
-          "pulls Mobius data out as Arrow columns and hands it to Nx as tensors.",
+        "On-device health detection over Mobius metric storage: " <>
+          "control charts, CUSUM, trend and distribution-drift detectors in Nx.",
       docs: docs(),
       package: package(),
       aliases: aliases(),
@@ -39,11 +40,27 @@ defmodule MobiusProcessing.MixProject do
         Recipes: ~r"guides/recipes/.*"
       ],
       groups_for_modules: [
+        Runtime: [
+          MobiusSmarts,
+          MobiusSmarts.Config,
+          MobiusSmarts.Config.Metric,
+          MobiusSmarts.Finding,
+          MobiusSmarts.Calibrate
+        ],
+        Detectors: [
+          MobiusSmarts.Detect,
+          MobiusSmarts.Detect.Jump,
+          MobiusSmarts.Detect.Shift,
+          MobiusSmarts.Detect.Drift,
+          MobiusSmarts.Detect.Trend,
+          MobiusSmarts.Detect.Changepoint,
+          MobiusSmarts.Detect.Shape,
+          MobiusSmarts.Detect.Novelty,
+          MobiusSmarts.Detect.Outlier
+        ],
         Recipes: [
-          MobiusProcessing.Recipes.CoreNx,
-          MobiusProcessing.Recipes.Scholar,
-          MobiusProcessing.Recipes.NxSignal,
-          MobiusProcessing.Recipes.DefnKernels
+          MobiusSmarts.Recipes.CoreNx,
+          MobiusSmarts.Recipes.DefnKernels
         ]
       ]
     ]
@@ -51,9 +68,9 @@ defmodule MobiusProcessing.MixProject do
 
   def package do
     [
-      name: :mobius_processing,
+      name: :mobius_smarts,
       licenses: ["Apache-2.0"],
-      links: %{"GitHub" => "https://github.com/TODO/mobius_processing"}
+      links: %{"GitHub" => "https://github.com/TODO/mobius_smarts"}
     ]
   end
 
@@ -94,16 +111,19 @@ defmodule MobiusProcessing.MixProject do
     ]
   end
 
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_env), do: ["lib"]
+
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
       {:nx, "~> 0.7"},
-      {:arrow, path: "../arrow"},
-      {:mobius, "~> 0.6"},
-      {:jason, "~> 1.4"},
-      {:scholar, "~> 0.3", optional: true},
-      {:nx_signal, "~> 0.2", optional: true},
+      {:telemetry, "~> 1.0"},
+      # Local path while the summary-window / histogram APIs live on the
+      # histograms branch; back to hex once released.
+      {:mobius, path: "../mobius"},
       {:nstandard, "~> 0.3"},
+      {:stream_data, "~> 1.1", only: [:dev, :test]},
       {:igniter, "~> 0.6", only: [:dev, :test]},
       {:ex_doc, "~> 0.40", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},

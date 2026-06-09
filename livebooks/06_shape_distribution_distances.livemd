@@ -1,0 +1,509 @@
+# Shape drift — PSI, Jensen–Shannon, and earth-mover distance
+
+```elixir
+Mix.install([
+  {:mobius_smarts, path: Path.expand("..", __DIR__)},
+  {:kino, "~> 0.14"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+```
+
+```elixir
+alias VegaLite, as: Vl
+alias MobiusSmarts.Detect.Shape
+alias Mobius.DDSketch
+```
+
+## A device that "looks fine" and isn't
+
+Here is the situation every other detector in this stack misses.
+
+A device reports request latency. For weeks it is one steady hum: most
+requests land around 20 ms, with some natural spread. Then a cooling
+fan starts to fail. The CPU begins **thermal-throttle cycling** — it
+runs cool and fast for a while, then overheats and crawls, then cools
+again, over and over. The single hum splits into two alternating
+regimes: a fast one near 13 ms and a slow, throttled one near 30 ms.
+
+Users feel it. But here is the trap: we are about to engineer the two
+states so that the **average and the spread barely move**. A
+*distribution* is the full picture of which values happen and how
+often. The average (mean) and the spread (standard deviation, "std")
+are just two numbers squeezed out of that picture — and infinitely many
+differently-shaped distributions share the same two numbers.
+
+Let's generate both states. We seed the random generator first so
+re-running this single cell always gives the same data.
+
+```elixir
+:rand.seed(:exsss, {1, 2, 3})
+
+# Baseline: one steady hum around 20 ms, moderate spread.
+baseline = for _ <- 1..6000, do: 20.0 + 6.5 * :rand.normal()
+
+# Current: thermal-throttle cycling. 60% of requests in a cool, tight
+# regime near 13 ms; 40% in a slow, throttled regime near 30 ms.
+current =
+  for _ <- 1..6000 do
+    if :rand.uniform() < 0.6 do
+      13.0 + 2.5 * :rand.normal()
+    else
+      30.0 + 4.0 * :rand.normal()
+    end
+  end
+
+{length(baseline), length(current)}
+```
+
+Now the summary table. A **percentile** is the value below which a given
+fraction of requests fall: the p50 (median) is the middle value, the
+p99 is the value only the slowest 1% exceed.
+
+```elixir
+mean = fn xs -> Enum.sum(xs) / length(xs) end
+
+std = fn xs ->
+  m = mean.(xs)
+  :math.sqrt(Enum.sum(Enum.map(xs, fn x -> (x - m) * (x - m) end)) / length(xs))
+end
+
+pctile = fn xs, p ->
+  s = Enum.sort(xs)
+  Enum.at(s, round(p * (length(s) - 1)))
+end
+
+summary = fn label, xs ->
+  %{
+    "series" => label,
+    "mean" => Float.round(mean.(xs), 1),
+    "std_dev" => Float.round(std.(xs), 1),
+    "p50" => Float.round(pctile.(xs, 0.50) * 1.0, 1),
+    "p99" => Float.round(pctile.(xs, 0.99) * 1.0, 1)
+  }
+end
+
+Kino.DataTable.new([summary.("baseline", baseline), summary.("current", current)])
+```
+
+Read that table slowly. **The mean is nearly identical (20.0 vs 19.7)
+and the std is close (6.5 vs 9.0)** — yet the median has fallen from
+20 ms to about 15 ms, and the p99 crept up. The Jump, Shift, and Drift
+detectors watch exactly the mean and the std. They are not bad at
+seeing this; they are *silent by construction*, because the two numbers
+they read barely changed.
+
+Now look at the actual shape.
+
+```elixir
+# Bin both states onto the SAME axis: count how many requests land in
+# each fixed-width slice. This mirrors what a Mobius DDSketch histogram
+# stores — values pre-aggregated into bins.
+lo = 0.0
+hi = 45.0
+nbins = 18
+bin_width = (hi - lo) / nbins
+
+bin_counts = fn xs ->
+  Enum.reduce(xs, List.duplicate(0, nbins), fn x, acc ->
+    i = min(nbins - 1, max(0, trunc((x - lo) / bin_width)))
+    List.update_at(acc, i, &(&1 + 1))
+  end)
+end
+
+bin_centers = for i <- 0..(nbins - 1), do: lo + (i + 0.5) * bin_width
+
+baseline_counts = bin_counts.(baseline)
+current_counts = bin_counts.(current)
+
+hist_rows =
+  for {c, label, counts} <- [
+        {nil, "baseline", baseline_counts},
+        {nil, "current", current_counts}
+      ],
+      {center, count} <- Enum.zip(bin_centers, counts),
+      _ = c do
+    %{"ms" => center, "count" => count, "series" => label}
+  end
+
+Vl.new(width: 700, height: 300, title: "Same mean and std, two completely different shapes")
+|> Vl.data_from_values(hist_rows)
+|> Vl.mark(:bar, opacity: 0.6)
+|> Vl.encode_field(:x, "ms", type: :quantitative, bin: %{step: bin_width})
+|> Vl.encode_field(:y, "count", type: :quantitative, stack: nil)
+|> Vl.encode_field(:color, "series", type: :nominal)
+```
+
+What to look at: the orange baseline is one bump; the blue current is
+**two** bumps with an empty valley right where the old typical value
+lived. No request now experiences the "average" latency of 20 ms — yet
+the average is still 20 ms. That valley is what the moments cannot see,
+and it is exactly what we need three purpose-built distances to measure.
+
+## From counts to proportions
+
+All three distances compare **proportions**, not raw counts: "what
+fraction of requests landed in each bin." Dividing by the total makes
+two histograms with different sample counts comparable.
+
+```elixir
+proportions = fn counts ->
+  total = Enum.sum(counts)
+  Enum.map(counts, &(&1 / total))
+end
+
+p = proportions.(baseline_counts)
+q = proportions.(current_counts)
+
+prop_rows =
+  for {center, pi, qi} <- Enum.zip([bin_centers, p, q]),
+      {label, val} <- [{"baseline", pi}, {"current", qi}] do
+    %{"ms" => center, "proportion" => Float.round(val, 4), "series" => label}
+  end
+
+Vl.new(width: 700, height: 250, title: "Fraction of requests in each bin")
+|> Vl.data_from_values(prop_rows)
+|> Vl.mark(:bar, opacity: 0.6)
+|> Vl.encode_field(:x, "ms", type: :quantitative, bin: %{step: bin_width})
+|> Vl.encode_field(:y, "proportion", type: :quantitative, stack: nil)
+|> Vl.encode_field(:color, "series", type: :nominal)
+```
+
+Same shape as before, now on a 0–1 scale. Every bin's `p` (baseline
+fraction) and `q` (current fraction) is what the formulas below chew
+on.
+
+## PSI — the number you can cite
+
+Population Stability Index asks: **how much have the bin proportions
+reshuffled?** Its formula sums one contribution per bin:
+
+```
+PSI = sum over bins of (q − p) · ln(q / p)
+```
+
+In words: for each bin, take how much its fraction changed (`q − p`),
+multiply by the log-ratio of the two fractions, and add them all up.
+Bins that swung hard in proportion contribute the most. Let's compute
+the per-bin contributions by hand so we can see *inside* the score.
+
+```elixir
+eps = 1.0e-4
+
+# Empty bins would make ln(q/p) blow up to infinity, so PSI floors each
+# proportion at a tiny eps. Shape.psi does this internally too.
+psi_terms =
+  for {pi, qi} <- Enum.zip(p, q) do
+    pf = max(pi, eps)
+    qf = max(qi, eps)
+    (qf - pf) * :math.log(qf / pf)
+  end
+
+psi_rows =
+  for {center, term} <- Enum.zip(bin_centers, psi_terms) do
+    %{"ms" => center, "contribution" => Float.round(term, 4)}
+  end
+
+Vl.new(width: 700, height: 250, title: "Per-bin PSI contribution — which bins drive the score")
+|> Vl.data_from_values(psi_rows)
+|> Vl.mark(:bar)
+|> Vl.encode_field(:x, "ms", type: :quantitative, bin: %{step: bin_width})
+|> Vl.encode_field(:y, "contribution", type: :quantitative)
+```
+
+What to look at: the two new peaks (~13 ms and ~30 ms gained mass) and
+the drained middle (~20 ms lost mass) are the tall bars — those bins
+*are* the drift. The sum of every bar is the PSI, and it matches the
+library function exactly.
+
+```elixir
+psi_by_hand = Enum.sum(psi_terms)
+psi_lib = Shape.psi(baseline_counts, current_counts)
+
+%{
+  "PSI summed by hand" => Float.round(psi_by_hand, 4),
+  "Shape.psi" => Float.round(psi_lib, 4)
+}
+```
+
+Both give **1.255**. PSI's real superpower is social, not mathematical.
+Decades of use in credit-scoring mean its thresholds are *conventions
+you can cite in a postmortem* instead of a number you invented on the
+spot: **below 0.1 is stable, 0.1–0.25 is drifting (watch it), above
+0.25 has shifted (act).** At 1.255 this device is far past "act."
+
+## Jensen–Shannon — the universal ruler
+
+PSI is unbounded, which makes it awkward to compare across metrics. JS
+divergence asks a related question — **how distinguishable are these two
+distributions?** — but answers on a fixed scale from `0` (identical) up
+to `ln 2 ≈ 0.693` (no overlap at all). Two tiny examples pin the ends
+of the ruler:
+
+```elixir
+%{
+  "identical distributions" => Shape.js_divergence([10, 20, 10], [10, 20, 10]),
+  "fully disjoint distributions" => Float.round(Shape.js_divergence([100, 0], [0, 100]), 4),
+  "ln 2 (the ceiling)" => Float.round(:math.log(2), 4)
+}
+```
+
+Identical gives exactly `0.0`; non-overlapping gives `0.6931`, which is
+`ln 2`. Because the scale never depends on the metric's units, JS scores
+are directly comparable across metrics. That is its real job: **ranking
+which of fifty metrics drifted most.** Here are five synthetic metrics
+against their baselines, sorted into a leaderboard.
+
+```elixir
+:rand.seed(:exsss, {4, 4, 4})
+
+base_hist = bin_counts.(for _ <- 1..6000, do: 20.0 + 5.0 * :rand.normal())
+
+metric_currents = [
+  {"cpu.temp", for(_ <- 1..6000, do: 20.5 + 5.0 * :rand.normal())},
+  {"disk.iowait", for(_ <- 1..6000, do: 23.0 + 5.0 * :rand.normal())},
+  {"net.rtt", for(_ <- 1..6000, do: 20.0 + 8.0 * :rand.normal())},
+  {"mem.pressure", for(_ <- 1..6000, do: 27.0 + 5.0 * :rand.normal())},
+  {"req.latency",
+   for _ <- 1..6000 do
+     if(:rand.uniform() < 0.5, do: 12.0 + 2.5 * :rand.normal(), else: 29.0 + 3.0 * :rand.normal())
+   end}
+]
+
+leaderboard =
+  metric_currents
+  |> Enum.map(fn {name, xs} ->
+    js = Shape.js_divergence(base_hist, bin_counts.(xs))
+    %{"metric" => name, "JS divergence" => Float.round(js, 3)}
+  end)
+  |> Enum.sort_by(& &1["JS divergence"], :desc)
+
+Kino.DataTable.new(leaderboard)
+```
+
+What to look at: one sweep, one comparable column, sorted worst-first.
+`req.latency` (the bimodal split) and `mem.pressure` (a clean shift)
+top the board; the barely-moved `cpu.temp` sits near zero. You did not
+have to know each metric's units to rank them.
+
+## Earth-mover — the distance you put in an alert
+
+The most human of the three. Picture each histogram as **piles of
+earth** along the value axis. The earth-mover's distance (formally the
+first Wasserstein distance, `moved_by`) asks: **how much earth must
+move, and how far, to reshape the baseline pile into the current one?**
+The answer comes out in the metric's own units — milliseconds here. The
+trivial case makes that literal:
+
+```elixir
+# All the mass sits at 10 ms, then all of it moves to 13 ms.
+# It moved by exactly 3.
+Shape.moved_by([100, 0, 0, 0], [0, 0, 0, 100], [10.0, 11.0, 12.0, 13.0])
+```
+
+Exactly `3.0`. The way to compute it without moving imaginary dirt is
+through the **CDF** — the cumulative distribution function, "what
+fraction of requests are at or below this value." The earth-mover
+distance is the area between the two CDF curves:
+
+```
+W1 = sum over bins of |CDF_baseline − CDF_current| · (next value − this value)
+```
+
+Let's draw both CDFs and shade the gap.
+
+```elixir
+cumsum = fn xs -> Enum.scan(xs, &(&1 + &2)) end
+
+cdf_b = cumsum.(p)
+cdf_c = cumsum.(q)
+
+cdf_rows =
+  for {center, cb, cc} <- Enum.zip([bin_centers, cdf_b, cdf_c]) do
+    %{"ms" => center, "baseline" => cb, "current" => cc}
+  end
+
+gap_area =
+  Vl.new()
+  |> Vl.mark(:area, opacity: 0.25, color: "purple")
+  |> Vl.encode_field(:x, "ms", type: :quantitative)
+  |> Vl.encode_field(:y, "baseline", type: :quantitative, title: "fraction at or below")
+  |> Vl.encode_field(:y2, "current")
+
+line_b =
+  Vl.new()
+  |> Vl.mark(:line, color: "orange")
+  |> Vl.encode_field(:x, "ms", type: :quantitative)
+  |> Vl.encode_field(:y, "baseline", type: :quantitative)
+
+line_c =
+  Vl.new()
+  |> Vl.mark(:line, color: "steelblue")
+  |> Vl.encode_field(:x, "ms", type: :quantitative)
+  |> Vl.encode_field(:y, "current", type: :quantitative)
+
+Vl.new(width: 700, height: 300, title: "Shaded area between the two CDFs = earth-mover distance")
+|> Vl.data_from_values(cdf_rows)
+|> Vl.layers([gap_area, line_b, line_c])
+```
+
+What to look at: the blue current curve climbs early (lots of fast
+requests) then stalls across the empty valley before catching up — the
+purple area between the curves is the whole distance, in milliseconds.
+
+```elixir
+moved_ms = Shape.moved_by(baseline_counts, current_counts, bin_centers)
+"The latency distribution moved by about #{Float.round(moved_ms, 1)} ms."
+```
+
+That sentence — **"moved right by about 3.4 ms"** — is the one to drop
+straight into an alert message. No one needs to know what a divergence
+of 0.14 means; everyone understands milliseconds.
+
+## Three drifts, three lenses
+
+So why keep all three? Because they disagree in useful ways. Here are
+three different things that can go wrong, built from one baseline: the
+distribution (a) shifts wholesale to the right, (b) keeps its center but
+widens, or (c) splits into a symmetric two-peaked shape. We score each
+with all three distances.
+
+```elixir
+:rand.seed(:exsss, {7, 7, 7})
+
+scen_base = for _ <- 1..6000, do: 20.0 + 5.0 * :rand.normal()
+scen_base_counts = bin_counts.(scen_base)
+
+scenarios = [
+  {"(a) shift right +8 ms", for(_ <- 1..6000, do: 28.0 + 5.0 * :rand.normal())},
+  {"(b) widen, same center", for(_ <- 1..6000, do: 20.0 + 9.0 * :rand.normal())},
+  {"(c) split, same center",
+   for _ <- 1..6000 do
+     if(:rand.uniform() < 0.5, do: 11.0 + 2.5 * :rand.normal(), else: 29.0 + 2.5 * :rand.normal())
+   end}
+]
+
+scenario_rows =
+  for {name, xs} <- scenarios do
+    cb = bin_counts.(xs)
+
+    %{
+      "scenario" => name,
+      "mean" => Float.round(mean.(xs), 1),
+      "std_dev" => Float.round(std.(xs), 1),
+      "PSI" => Float.round(Shape.psi(scen_base_counts, cb), 2),
+      "JS" => Float.round(Shape.js_divergence(scen_base_counts, cb), 3),
+      "moved_by (ms)" => Float.round(Shape.moved_by(scen_base_counts, cb, bin_centers), 2)
+    }
+  end
+
+Kino.DataTable.new(scenario_rows)
+```
+
+What to look at, row by row. The **shift** has the biggest `moved_by`
+(≈ 8 ms — earth literally travelled 8 ms to the right). The **split**
+has a moderate `moved_by` (≈ 5 ms) because mass moved both left *and*
+right and the trips partly cancel — but its PSI and JS are the *largest*
+of all three, because they count reshuffling regardless of direction.
+That is the whole reason there are three: `moved_by` measures net
+displacement in real units (great for "how bad, in ms"), while PSI and
+JS measure how scrambled the shape is (great for "did the shape change
+at all").
+
+## Try it: how far apart are the two regimes?
+
+Drag the slider to set the gap between the cool and throttled regimes,
+then re-run the two cells below. A bigger gap is a worse fan failure.
+
+```elixir
+gap_input = Kino.Input.range("Regime gap (ms)", min: 4.0, max: 30.0, default: 17.0, step: 1.0)
+```
+
+```elixir
+gap = Kino.Input.read(gap_input)
+
+:rand.seed(:exsss, {9, 9, 9})
+slider_base = for _ <- 1..6000, do: 21.0 + 6.0 * :rand.normal()
+
+center = 21.0
+cool_peak = center - gap / 2
+hot_peak = center + gap / 2
+
+slider_current =
+  for _ <- 1..6000 do
+    if(:rand.uniform() < 0.6,
+      do: cool_peak + 2.5 * :rand.normal(),
+      else: hot_peak + 4.0 * :rand.normal()
+    )
+  end
+
+sb_counts = bin_counts.(slider_base)
+sc_counts = bin_counts.(slider_current)
+
+%{
+  "regime gap (ms)" => gap,
+  "PSI" => Float.round(Shape.psi(sb_counts, sc_counts), 2),
+  "JS" => Float.round(Shape.js_divergence(sb_counts, sc_counts), 3),
+  "moved_by (ms)" => Float.round(Shape.moved_by(sb_counts, sc_counts, bin_centers), 2)
+}
+```
+
+At the default gap of 17 ms you get roughly PSI 1.45 / JS 0.16 /
+moved_by 3.9 ms. Widen the gap and all three climb together; narrow it
+and they collapse toward zero as the two regimes merge back into one
+hum.
+
+## Where the histograms come from in production
+
+We binned raw samples by hand to see the mechanics, but on a real
+device Mobius has already done this for you: it stores a
+**`Mobius.DDSketch`** histogram per metric — values pre-aggregated into
+bins at observation time. `Shape.from_sketches/2` lines two sketches up
+on a shared bin axis so the three functions apply directly. Here is the
+latency story driven through real sketches instead of hand-rolled bins.
+
+```elixir
+:rand.seed(:exsss, {1, 2, 3})
+
+# Latency is positive; feed the same baseline/current shapes into sketches.
+to_sketch = fn xs ->
+  Enum.reduce(xs, DDSketch.new(relative_accuracy: 0.05), fn x, s ->
+    DDSketch.insert(s, max(x, 0.1))
+  end)
+end
+
+sketch_base = to_sketch.(for _ <- 1..6000, do: 20.0 + 6.5 * :rand.normal())
+
+sketch_curr =
+  to_sketch.(
+    for _ <- 1..6000 do
+      if(:rand.uniform() < 0.6, do: 13.0 + 2.5 * :rand.normal(), else: 30.0 + 4.0 * :rand.normal())
+    end
+  )
+
+aligned = Shape.from_sketches(sketch_base, sketch_curr)
+
+%{
+  "bins on shared axis" => Nx.size(aligned.values),
+  "PSI" => Float.round(Shape.psi(aligned.baseline, aligned.current), 3),
+  "JS" => Float.round(Shape.js_divergence(aligned.baseline, aligned.current), 3),
+  "moved_by (ms)" => Float.round(Shape.moved_by(aligned.baseline, aligned.current, aligned.values), 2),
+  "baseline p99 (sketch)" => Float.round(DDSketch.quantile(sketch_base, 0.99), 1),
+  "current p99 (sketch)" => Float.round(DDSketch.quantile(sketch_curr, 0.99), 1)
+}
+```
+
+The sketch-driven scores (PSI ≈ 1.26, JS ≈ 0.14, moved_by ≈ 3.4 ms)
+land right on top of the hand-binned ones — same story, no manual
+binning. In production, a trailing baseline sketch is just bin addition
+upstream, since DDSketch bins are mergeable.
+
+## The blind spot
+
+Shape distances tell you *that* the shape changed and *how much* — they
+do not tell you **when** it changed. A PSI of 1.3 over a one-week window
+could be a slow slide or a step that happened last Tuesday. For the
+*when*, pair these with the Changepoint detector (notebook 05). They
+also need enough samples per histogram to be stable: a sketch built
+from a handful of requests will rattle with noise and cry drift where
+there is none. Give each side a healthy count before you trust the
+number you put in the alert.
