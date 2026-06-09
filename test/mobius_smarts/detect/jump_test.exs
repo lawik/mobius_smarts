@@ -65,6 +65,34 @@ defmodule MobiusSmarts.Detect.JumpTest do
     end
   end
 
+  describe "input validation" do
+    test "an empty series raises an explanatory error, not a cryptic Nx one" do
+      assert_raise ArgumentError, ~r/:empty/, fn -> Jump.scan([], [], 25) end
+      assert_raise ArgumentError, ~r/:empty/, fn -> Jump.baseline([], [], 25) end
+    end
+
+    test "a window count below 1 raises instead of producing NaN/inf limits" do
+      assert_raise ArgumentError, ~r/count/, fn ->
+        Jump.scan([10.0, 10.0], [1.0, 1.0], [30, 0], baseline: {10.0, 1.0})
+      end
+
+      assert_raise ArgumentError, ~r/count/, fn ->
+        Jump.scan([10.0, 10.0], [1.0, 1.0], [30, -2], baseline: {10.0, 1.0})
+      end
+    end
+
+    test "a count of exactly 1 stays legal — excluded from the wobble chart, not rejected" do
+      result = Jump.scan([10.0, 10.0], [1.0, 0.0], [30, 1], baseline: {10.0, 1.0})
+      assert Nx.to_flat_list(result.wobbles) == [0, 0]
+    end
+
+    test "all-singleton windows raise the dedicated NoDispersionError" do
+      assert_raise Jump.NoDispersionError, ~r/fewer than 2 reports/, fn ->
+        Jump.baseline([1.0, 2.0], [0.0, 0.0], 1)
+      end
+    end
+  end
+
   describe "detection behavior" do
     test "flags a dispersion blow-up that the mean chart misses" do
       # Mean dead stable; within-window std triples at window 3.
