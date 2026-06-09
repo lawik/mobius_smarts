@@ -123,5 +123,36 @@ defmodule MobiusSmarts.Detect.ChangepointTest do
       assert Changepoint.detect([]) == []
       assert Changepoint.detect([5.0]) == []
     end
+
+    test "detection is shift-invariant: large means must not corrupt the split" do
+      # SSE gains are invariant under adding a constant, so a bytes-scale
+      # offset (think memory gauges around 1e9) must not move, mask, or
+      # invent change points. Naive prefix-sum SSE cancels catastrophically
+      # at large mean²/variance unless the values are centered first.
+      base = List.duplicate(10.0, 30) ++ List.duplicate(20.0, 30)
+      assert Changepoint.detect(base) == [30]
+
+      for offset <- [1.0e6, 1.0e9] do
+        shifted = Enum.map(base, &(&1 + offset))
+        assert Changepoint.detect(shifted) == [30]
+      end
+    end
+
+    test "shift invariance holds for a noisy step" do
+      :rand.seed(:exsss, {91, 92, 93})
+
+      base =
+        Enum.map(1..60, fn _ -> 50.0 + 1.0 * :rand.normal() end) ++
+          Enum.map(1..60, fn _ -> 54.0 + 1.0 * :rand.normal() end)
+
+      expected = Changepoint.detect(base)
+      assert [tau] = expected
+      assert tau in 57..63
+
+      for offset <- [1.0e6, 1.0e9] do
+        shifted = Enum.map(base, &(&1 + offset))
+        assert Changepoint.detect(shifted) == expected
+      end
+    end
   end
 end
