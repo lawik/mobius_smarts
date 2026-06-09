@@ -27,7 +27,11 @@ defmodule MobiusSmarts.Detect.Changepoint do
   0.5-degree reporting, idle stretches) where *most* consecutive windows
   are exactly equal, collapsing the median to zero — falls back to the
   plain standard deviation of the differences, so step-quantized but
-  stable series don't shatter into false segments. The BIC-style
+  stable series don't shatter into false segments. Mind which way that
+  fallback fails: it is *not* robust, so in the quantized regime a
+  genuine change inflates the sd-of-diffs noise estimate, raising the
+  penalty exactly when a real change is present — large steps survive,
+  but subtle changes can mask themselves. The BIC-style
   penalty still presumes roughly continuous-valued noise; for heavily
   quantized series prefer an explicit `:penalty` scaled to the
   quantization step.
@@ -125,12 +129,22 @@ defmodule MobiusSmarts.Detect.Changepoint do
   # the first index of the right segment.
   defp best_split(values, min_size) do
     n = Nx.size(values)
+
+    # SSE gains are shift-invariant, so center first: the prefix-sum
+    # identity cancels catastrophically once mean² dwarfs the variance
+    # (bytes-scale gauges around 1e9), missing real steps and inventing
+    # phantom ones.
+    values = Nx.subtract(values, Nx.mean(values))
+
     s1 = Nx.cumulative_sum(values)
     s2 = Nx.cumulative_sum(Nx.pow(values, 2))
 
-    total1 = Nx.to_number(s1[-1])
-    total2 = Nx.to_number(s2[-1])
-    sse_total = total2 - total1 * total1 / n
+    # The totals stay f64 tensors — round-tripped through Nx.to_number
+    # they would re-enter the expressions below as bare floats, which
+    # Nx wraps as f32 before binary ops, corrupting every per-split cost.
+    total1 = s1[-1]
+    total2 = s2[-1]
+    sse_total = Nx.to_number(Nx.subtract(total2, Nx.divide(Nx.pow(total1, 2), n)))
 
     # Split tau in 1..n-1: left = values[0, tau), sums are s1/s2 at tau - 1.
     left_sum = Nx.slice(s1, [0], [n - 1])
