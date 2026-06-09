@@ -23,8 +23,12 @@ bimodality) that are mathematically invisible to the first two moments.
 
 ## Principles
 
-- **Pure functions.** No GenServers, no schedulers. On demand, periodic, or
-  streaming is the caller's call; the same functions serve all three.
+- **Pure functions at the core.** The detector layer has no GenServers and
+  no schedulers: on demand, periodic, or streaming is the caller's call, and
+  the same functions serve all three. The `MobiusSmarts` runtime is a thin
+  opt-in shell over those pure functions — it owns cadence and finding
+  state, never detection logic, and the detectors stay fully usable
+  without it.
 - **Batch and streaming forms.** Batch scans are vectorized in Nx (CUSUM via
   the reflection identity, change-point scans via prefix sums, Theil-Sen via
   pairwise matrices). Sequential recursions that Nx can't vectorize (EWMA)
@@ -73,6 +77,29 @@ Detector outputs favor *diagnosis* over bare booleans: CUSUM dates the onset
 of a shift, not just its detection; Trend returns ETAs in seconds; the
 change-point sweep returns the regime boundaries worth correlating with the
 event log.
+
+### `MobiusSmarts` — the runtime
+
+The opt-in supervision tree over the layers above; everything it does
+reduces to `Source` reads and `Detect` calls.
+
+- `MobiusSmarts` — `start_link/1` (the child spec), plus the read API:
+  `status/0`, `findings/0`, `observations/0`, `baseline/2`.
+- `MobiusSmarts.Config` — validated configuration: the `:watch` list
+  (with optional ceilings), the `:false_alarm_budget`, and the
+  interval/window/hysteresis knobs, each with a stated default.
+- `MobiusSmarts.Calibrate` — the budget inverted through each detector's
+  average-run-length math into concrete thresholds; the reason `concern`
+  is comparable across detectors.
+- `MobiusSmarts.Finding` — one detected issue with a lifecycle:
+  conditions (raised/escalated/cleared, drive the health level) and
+  observations (recorded once), each carrying onset, concern, evidence,
+  and a human message.
+- Internals, deliberately undocumented as API: the `Board` (ETS-backed
+  finding lifecycle and health level), the `Watcher` (the fast
+  per-`:interval` detector pass) and the `Sweeper` (the slow
+  per-`:sweep_interval` pass plus guarded baseline refits), with the
+  pure `Analysis` layer between them and the detectors.
 
 ## Data shapes expected on a Nerves device
 

@@ -58,6 +58,16 @@ defmodule MobiusSmarts.Source do
   pooling. Windows with no reports contribute no point — gaps show as
   missing timestamps, which is itself a health signal worth checking
   before running detectors.
+
+  A caveat on `std_dev`: Mobius currently computes it with a naive
+  sum-of-squares accumulator, which cancels catastrophically when the
+  values are large floats relative to their spread — memory in bytes is
+  the classic case. The result is a std_dev that is noise-floor garbage
+  without being obviously wrong (it never goes negative), and std_dev is
+  the calibration keystone for the whole detector stack. For
+  large-magnitude metrics, prefer scaling at the reporter — report
+  percent rather than bytes — until Mobius computes summaries with a
+  stable algorithm.
   """
   @spec summary_series(Mobius.metric_name(), map(), keyword()) :: summary_series() | :empty
   def summary_series(metric_name, tags \\ %{}, opts \\ []) do
@@ -126,6 +136,9 @@ defmodule MobiusSmarts.Source do
   Convert summary windows (`%{timestamp: ..., average: ..., std_dev:
   ..., reports: ...}`, as returned by `Mobius.Data.summary_windows/3`)
   into tensors.
+
+  Windows that came out of Mobius inherit the `std_dev` precision
+  caveat on `summary_series/3`.
 
   ## Examples
 
