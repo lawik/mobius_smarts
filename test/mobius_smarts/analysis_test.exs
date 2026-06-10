@@ -9,7 +9,10 @@ defmodule MobiusSmarts.AnalysisTest do
   # Hand-tuned thresholds in the detector-default range, so scenarios
   # don't depend on Calibrate internals.
   defp calib, do: %{arl: 1000.0, jump_limit: 3.5, ewma_l: 3.0, cusum_h: 6.0}
-  defp config, do: Config.new!(watch: [])
+
+  defp config do
+    Config.new!(watch: [], resolution: {1, :minute}, false_alarm_every: {1, :week})
+  end
 
   defp windows(values, opts \\ []) do
     cadence = Keyword.get(opts, :cadence, 60)
@@ -37,15 +40,14 @@ defmodule MobiusSmarts.AnalysisTest do
     }
   end
 
-  describe "gaps/2 and active_segment/2" do
-    test "finds gaps against the series' own cadence and re-anchors after them" do
+  describe "gaps/3 and active_segment/2" do
+    test "finds gaps against the stated cadence and re-anchors after them" do
       ts = Enum.map(0..9, &(&1 * 60)) ++ Enum.map(0..9, &(3600 + &1 * 60))
       lists = %{ts: ts, avg: List.duplicate(1.0, 20), std: [], reports: []}
       lists = %{lists | std: List.duplicate(0.1, 20), reports: List.duplicate(5, 20)}
 
-      {cadence, gaps} = Analysis.gaps(lists.ts, 3.0)
+      gaps = Analysis.gaps(lists.ts, 3.0, 60)
 
-      assert cadence == 60
       assert gaps == [{540, 3600}]
 
       segment = Analysis.active_segment(lists, gaps)
@@ -54,9 +56,19 @@ defmodule MobiusSmarts.AnalysisTest do
     end
 
     test "a steady series has no gaps" do
-      {cadence, gaps} = Analysis.gaps(Enum.map(0..99, &(&1 * 60)), 3.0)
-      assert cadence == 60
-      assert gaps == []
+      assert Analysis.gaps(Enum.map(0..99, &(&1 * 60)), 3.0, 60) == []
+    end
+  end
+
+  describe "median_cadence/1" do
+    test "measures the dominant step, undistorted by an isolated gap" do
+      ts = Enum.map(0..9, &(&1 * 60)) ++ Enum.map(0..9, &(3600 + &1 * 60))
+      assert Analysis.median_cadence(ts) == 60
+    end
+
+    test "refuses to guess from fewer than 3 timestamps" do
+      assert Analysis.median_cadence([0, 60]) == nil
+      assert Analysis.median_cadence([]) == nil
     end
   end
 
@@ -309,6 +321,18 @@ defmodule MobiusSmarts.AnalysisTest do
 
       assert [candidate] = Analysis.trend_candidates(lists, metric, config())
       assert candidate.kind == :approaching_limit
+    end
+
+    test "a series spanning a sliver of the trend window projects nothing, however steep" do
+      seeded(36)
+      # The same significant climb as the ETA scenario, but the series
+      # spans only ~47 minutes of the 24-hour trend window — an ETA
+      # extrapolated from that sliver would be a guess, not a fit.
+      values = Enum.map(0..47, &(46.0 + &1 * 0.5 + noise(0.1)))
+      lists = windows(values, cadence: 60)
+      metric = %Config.Metric{name: "disk", ceiling: 95.0}
+
+      assert Analysis.trend_candidates(lists, metric, config()) == []
     end
 
     test "evidence matches an independent per-threshold Trend computation exactly" do

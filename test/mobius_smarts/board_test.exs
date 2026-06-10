@@ -5,7 +5,15 @@ defmodule MobiusSmarts.BoardTest do
 
   setup ctx do
     name = :"board_test_#{ctx.test}"
-    config = Config.new!(watch: ["m"], clear_after: 3)
+
+    config =
+      Config.new!(
+        watch: ["m"],
+        resolution: {1, :minute},
+        false_alarm_every: {1, :week},
+        clear_after: 3
+      )
+
     board = start_supervised!({Board, name: name, config: config})
 
     handler_id = "board-test-#{inspect(ctx.test)}"

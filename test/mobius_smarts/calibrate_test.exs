@@ -54,8 +54,8 @@ defmodule MobiusSmarts.CalibrateTest do
       config =
         Config.new!(
           watch: ["a", "b", "c"],
-          interval: {1, :minute},
-          false_alarm_budget: {1, :week}
+          resolution: {1, :minute},
+          false_alarm_every: {1, :week}
         )
 
       calib = Calibrate.for_config(config)
@@ -68,8 +68,15 @@ defmodule MobiusSmarts.CalibrateTest do
     end
 
     test "a tighter budget means lower thresholds" do
-      loose = Calibrate.for_config(Config.new!(watch: ["a"], false_alarm_budget: {30, :day}))
-      tight = Calibrate.for_config(Config.new!(watch: ["a"], false_alarm_budget: {1, :hour}))
+      loose =
+        Calibrate.for_config(
+          Config.new!(watch: ["a"], resolution: {1, :minute}, false_alarm_every: {30, :day})
+        )
+
+      tight =
+        Calibrate.for_config(
+          Config.new!(watch: ["a"], resolution: {1, :minute}, false_alarm_every: {1, :hour})
+        )
 
       assert tight.jump_limit < loose.jump_limit
       assert tight.cusum_h < loose.cusum_h

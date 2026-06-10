@@ -33,23 +33,29 @@ defmodule MobiusSmarts.Analysis do
 
   @doc """
   Find reporting gaps: window-to-window steps longer than `gap_factor`
-  times the series' own median cadence. Returns `{cadence_s, gaps}`
-  with gaps as `{last_seen_ts, resumed_ts}` pairs.
+  times `cadence_s`, the configured window width in seconds (the
+  cadence is stated, never inferred — see `Config` `:resolution`).
+  Returns gaps as `{last_seen_ts, resumed_ts}` pairs.
   """
-  @spec gaps([integer()], number()) :: {pos_integer() | nil, [{integer(), integer()}]}
-  def gaps(ts, _gap_factor) when length(ts) < 3, do: {nil, []}
+  @spec gaps([integer()], number(), pos_integer()) :: [{integer(), integer()}]
+  def gaps(ts, gap_factor, cadence_s) do
+    ts
+    |> Enum.chunk_every(2, 1, :discard)
+    |> Enum.filter(fn [a, b] -> b - a > gap_factor * cadence_s end)
+    |> Enum.map(fn [a, b] -> {a, b} end)
+  end
 
-  def gaps(ts, gap_factor) do
-    diffs = ts |> Enum.chunk_every(2, 1, :discard) |> Enum.map(fn [a, b] -> b - a end)
-    cadence = median(diffs)
+  @doc """
+  The series' measured median window-to-window step in seconds, or
+  `nil` under 3 windows. Diagnostic only — the runtime detects gaps
+  against the configured `:resolution` and uses this to warn when the
+  stored data disagrees with it.
+  """
+  @spec median_cadence([integer()]) :: number() | nil
+  def median_cadence(ts) when length(ts) < 3, do: nil
 
-    gaps =
-      ts
-      |> Enum.chunk_every(2, 1, :discard)
-      |> Enum.filter(fn [a, b] -> b - a > gap_factor * cadence end)
-      |> Enum.map(fn [a, b] -> {a, b} end)
-
-    {cadence, gaps}
+  def median_cadence(ts) do
+    ts |> Enum.chunk_every(2, 1, :discard) |> Enum.map(fn [a, b] -> b - a end) |> median()
   end
 
   @doc """
@@ -397,14 +403,18 @@ defmodule MobiusSmarts.Analysis do
 
   @doc """
   `:approaching_limit` candidates for a metric with a configured
-  ceiling or floor, gated on Mann–Kendall significance so a slope is
-  only projected when the trend is statistically real.
+  ceiling or floor, gated twice so a slope is only projected when
+  there is real evidence behind it: Mann–Kendall significance (the
+  trend is statistically there) and span coverage (the fitted series
+  spans at least half of `:trend_window` — an ETA extrapolated from a
+  sliver of the window it claims to summarize is a guess, not a fit).
   """
   @spec trend_candidates(lists(), Config.Metric.t(), Config.t()) :: [candidate()]
   def trend_candidates(lists, metric, config) when length(lists.avg) >= 5 do
-    mk = Trend.mann_kendall(lists.avg)
+    span = List.last(lists.ts) - List.first(lists.ts)
+    mk = if 2 * span >= Config.seconds(config.trend_window), do: Trend.mann_kendall(lists.avg)
 
-    if mk.trend == :none do
+    if mk == nil or mk.trend == :none do
       []
     else
       warn_s = Config.seconds(config.warn_horizon)

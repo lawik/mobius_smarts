@@ -10,7 +10,8 @@ defmodule MobiusSmarts.Calibrate do
   whole* false-alarms at roughly the budgeted rate on a healthy
   device:
 
-  - the budget is converted to windows (`budget / interval`),
+  - the budget is converted to windows (`false_alarm_every /
+    resolution` — both stated in config, no inference),
   - split Bonferroni-style across every alarm stream being watched
     (four per metric: jump, wobble, shift, drift — plus novelty),
   - and inverted through each detector's ARL relation: the normal tail
@@ -56,7 +57,7 @@ defmodule MobiusSmarts.Calibrate do
   """
   @spec for_config(Config.t()) :: t()
   def for_config(%Config{} = config) do
-    budget_windows = Config.ms(config.false_alarm_budget) / max(Config.ms(config.interval), 1)
+    budget_windows = Config.ms(config.false_alarm_every) / max(Config.ms(config.resolution), 1)
 
     streams =
       4 * length(config.watch) +

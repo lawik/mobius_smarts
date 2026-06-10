@@ -8,9 +8,8 @@ defmodule MobiusSmartsTest do
 
   alias MobiusSmarts.StubSource
 
-  # The stub's 60s window cadence intentionally mismatches the
-  # millisecond tick interval, which (correctly) logs a calibration
-  # warning per metric — keep it out of passing-test output.
+  # Keep incidental runtime logging (e.g. a tick racing a re-stage)
+  # out of passing-test output.
   @moduletag :capture_log
 
   doctest MobiusSmarts
@@ -38,6 +37,11 @@ defmodule MobiusSmartsTest do
       watch: watch,
       source: StubSource,
       mobius_instance: instance,
+      # Staged windows are 60s apart; gap detection and staleness key
+      # off :resolution, so it must match. :interval stays a fast test
+      # clock — it is scheduling-only.
+      resolution: {1, :minute},
+      false_alarm_every: {1, :week},
       interval: 25,
       sweep_interval: 60_000,
       min_baseline_windows: 60,

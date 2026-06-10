@@ -35,16 +35,12 @@ defmodule MobiusSmarts.Source do
         }
 
   @typedoc """
-  Target cadence for `resample_windows/2`: `:auto` (coarsest native
-  RRD cadence present), `:native` (Mobius's mixed-cadence windows,
-  untouched), or an explicit `t:MobiusSmarts.Config.duration/0`.
+  Target cadence for `summary_series/3` and `resample_windows/2`: an
+  explicit `t:MobiusSmarts.Config.duration/0` naming the Mobius RRD
+  tier you mean to read at, or `:native` for Mobius's mixed-cadence
+  windows untouched.
   """
-  @type resolution() :: :auto | :native | Config.duration()
-
-  # Mobius.RRD archives snapshots at second/minute/hour/day cadence
-  # simultaneously; a window-to-window step is snapped down to the
-  # archive tier it can only have come from.
-  @tiers_desc [86_400, 3_600, 60, 1]
+  @type resolution() :: :native | Config.duration()
 
   @doc """
   Pull a numeric metric series from Mobius.
@@ -81,7 +77,7 @@ defmodule MobiusSmarts.Source do
   missing timestamps, which is itself a health signal worth checking
   before running detectors.
 
-  ## Window resolution
+  ## Window resolution (required)
 
   Mobius's RRD stores snapshots at four cadences at once (seconds,
   minutes, hours, days — see `Mobius.RRD`), and
@@ -90,14 +86,13 @@ defmodule MobiusSmarts.Source do
   comes back with second-cadence windows for the freshest couple of
   minutes, minute-cadence behind that, and so on. The detectors assume
   comparable windows — mixed cadences read as reporting gaps and
-  incomparable subgroups — so this function resamples to one cadence:
+  incomparable subgroups — so this function requires you to state the
+  cadence; it will not guess one from the data:
 
-  - `resolution: :auto` (default) — buckets of the coarsest native
-    cadence present in the result; a 2-hour query yields minute
-    windows throughout.
-  - `resolution: duration` — an explicit `{1, :minute}`-style bucket
-    width (or raw milliseconds). Narrower than the coarsest native
-    cadence in range reintroduces the gaps `:auto` exists to remove.
+  - `resolution: duration` — a `{1, :minute}`-style bucket width (or
+    raw milliseconds) naming the RRD tier you mean to read at. Pick
+    one whose archive spans the window you query — narrower than the
+    coarsest tier in range leaves gaps between the coarse windows.
   - `resolution: :native` — Mobius's mixed-cadence windows, untouched.
 
   Resampling merges sum/sum-of-squares/count deltas, so a merged
@@ -116,7 +111,15 @@ defmodule MobiusSmarts.Source do
   """
   @spec summary_series(Mobius.metric_name(), map(), keyword()) :: summary_series() | :empty
   def summary_series(metric_name, tags \\ %{}, opts \\ []) do
-    {resolution, opts} = Keyword.pop(opts, :resolution, :auto)
+    {resolution, opts} = Keyword.pop(opts, :resolution)
+
+    if is_nil(resolution) do
+      raise ArgumentError,
+            "summary_series/3 needs a :resolution — Mobius stores several RRD tiers at " <>
+              "once and this function will not guess which one you mean. Pass the tier " <>
+              "to read at (e.g. resolution: {1, :minute}), or resolution: :native for " <>
+              "Mobius's mixed-cadence windows untouched."
+    end
 
     case Mobius.Data.summary_windows(metric_name, tags, opts) do
       {:ok, windows} -> windows |> resample_windows(resolution) |> from_summary_windows()
@@ -229,13 +232,6 @@ defmodule MobiusSmarts.Source do
   (its end, for complete buckets), so a trailing partial bucket never
   claims a timestamp from the future.
 
-  `:auto` measures the coarsest native RRD cadence present: each
-  window-to-window step is snapped down to the archive tier it can
-  only have come from (second/minute/hour/day), and a tier counts only
-  when two *consecutive* steps agree on it — an isolated long step is
-  an outage, not a cadence. With fewer than 3 windows (or no agreeing
-  pair) the windows pass through unchanged.
-
   ## Examples
 
       iex> windows = [
@@ -248,13 +244,6 @@ defmodule MobiusSmarts.Source do
   """
   @spec resample_windows([window()], resolution()) :: [window()]
   def resample_windows(windows, :native), do: windows
-
-  def resample_windows(windows, :auto) do
-    case native_cadence(windows) do
-      nil -> windows
-      width -> resample_windows(windows, {width, :second})
-    end
-  end
 
   def resample_windows(windows, resolution) do
     case Config.seconds(resolution) do
@@ -273,21 +262,6 @@ defmodule MobiusSmarts.Source do
         |> Enum.map(fn {_bucket_end, members} -> merge_windows(members) end)
     end
   end
-
-  defp native_cadence(windows) when length(windows) < 3, do: nil
-
-  defp native_cadence(windows) do
-    windows
-    |> Enum.map(& &1.timestamp)
-    |> Enum.chunk_every(2, 1, :discard)
-    |> Enum.map(fn [a, b] -> snap_tier(b - a) end)
-    |> Enum.chunk_every(2, 1, :discard)
-    |> Enum.filter(fn [a, b] -> a == b end)
-    |> Enum.map(&hd/1)
-    |> Enum.max(fn -> nil end)
-  end
-
-  defp snap_tier(diff), do: Enum.find(@tiers_desc, 1, &(&1 <= diff))
 
   defp merge_windows([window]), do: window
 

@@ -94,6 +94,7 @@ defmodule MobiusSmarts.Watcher do
     series =
       config.source.summary_series(metric.name, metric.tags,
         last: config.analysis_window,
+        resolution: config.resolution,
         mobius_instance: config.mobius_instance
       )
 
@@ -104,13 +105,14 @@ defmodule MobiusSmarts.Watcher do
 
       series ->
         lists = Analysis.to_lists(series)
-        {cadence, gaps} = Analysis.gaps(lists.ts, config.gap_factor)
+        resolution_s = Config.seconds(config.resolution)
+        gaps = Analysis.gaps(lists.ts, config.gap_factor, resolution_s)
         segment = Analysis.active_segment(lists, gaps)
         last_ts = List.last(segment.ts)
 
-        state = warn_cadence_mismatch(state, metric, key, cadence)
+        state = warn_cadence_mismatch(state, metric, key, Analysis.median_cadence(lists.ts))
 
-        stale_after = config.gap_factor * max(cadence || 0, Config.seconds(config.interval))
+        stale_after = config.gap_factor * resolution_s
         stale? = now - last_ts > stale_after
 
         candidates =
@@ -130,26 +132,28 @@ defmodule MobiusSmarts.Watcher do
     end
   end
 
-  # Calibration converts the false-alarm budget to windows through
-  # `:interval` (`Calibrate.for_config/1`), assuming the tick interval
-  # matches the Mobius RRD window cadence. When the series' own median
-  # cadence disagrees by more than 50%, every derived threshold is
-  # miscalibrated by roughly the ratio — worth one warning per metric,
-  # not one per tick.
-  defp warn_cadence_mismatch(state, metric, key, cadence) do
-    interval_s = Config.ms(state.config.interval) / 1000
+  # Gap detection, staleness, and the false-alarm calibration all key
+  # off the configured `:resolution`; resampling guarantees the series
+  # matches it whenever Mobius stores data at least that fine. So a
+  # measured median cadence disagreeing by more than 50% means Mobius
+  # is not recording at the cadence the config claims (e.g. the RRD
+  # tier is coarser than `:resolution`) — every derived number is off
+  # by roughly the ratio. Worth one warning per metric, not per tick.
+  defp warn_cadence_mismatch(state, metric, key, measured) do
+    resolution_s = Config.ms(state.config.resolution) / 1000
 
     mismatched? =
-      cadence != nil and cadence > 0 and interval_s > 0 and
-        abs(cadence - interval_s) > 0.5 * interval_s
+      measured != nil and measured > 0 and
+        abs(measured - resolution_s) > 0.5 * resolution_s
 
     if mismatched? and not MapSet.member?(state.cadence_warned, key) do
-      ratio = Float.round(max(cadence / interval_s, interval_s / cadence), 1)
+      ratio = Float.round(max(measured / resolution_s, resolution_s / measured), 1)
 
       Logger.warning(
-        "MobiusSmarts: #{metric.name} reports every ~#{cadence}s but :interval is " <>
-          "#{interval_s}s — the false-alarm budget is calibrated against :interval " <>
-          "and will be off by roughly #{ratio}x"
+        "MobiusSmarts: #{metric.name} windows arrive every ~#{measured}s but :resolution " <>
+          "is #{resolution_s}s — Mobius does not seem to store data at the configured " <>
+          "resolution, so gap detection and the false-alarm calibration are off by " <>
+          "roughly #{ratio}x"
       )
 
       %{state | cadence_warned: MapSet.put(state.cadence_warned, key)}
@@ -194,10 +198,9 @@ defmodule MobiusSmarts.Watcher do
   # be fabricated. And because the model was fitted on timestamp-ALIGNED
   # rows only (`Analysis.fit_novelty/3` intersects timestamps), the
   # scored vector must be aligned too: the per-metric latest timestamps
-  # may spread by at most one configured `:interval` — the declared RRD
-  # cadence (chosen over the measured cadence, which is per-metric and
-  # could disagree between metrics). Values further apart than that
-  # straddle windows the model never saw side by side.
+  # may spread by at most one configured `:resolution` window. Values
+  # further apart than that straddle windows the model never saw side
+  # by side.
   defp vector_for(model, latest, config) do
     values = Enum.map(model.keys, &latest[&1])
 
@@ -210,6 +213,6 @@ defmodule MobiusSmarts.Watcher do
 
   defp aligned?(values, config) do
     {min_ts, max_ts} = values |> Enum.map(&elem(&1, 0)) |> Enum.min_max()
-    max_ts - min_ts <= Config.seconds(config.interval)
+    max_ts - min_ts <= Config.seconds(config.resolution)
   end
 end

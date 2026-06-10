@@ -83,15 +83,18 @@ defmodule MobiusSmarts.Sweeper do
 
   defp trend_candidates(_state, %{ceiling: nil, floor: nil}), do: []
 
+  # Trend fits run at :trend_resolution (config requires it alongside
+  # any ceiling/floor) — the coarser cadence whose RRD tier actually
+  # spans :trend_window.
   defp trend_candidates(state, metric) do
-    case pull(state, metric, state.config.trend_window) do
+    case pull(state, metric, state.config.trend_window, state.config.trend_resolution) do
       :empty -> []
       lists -> Analysis.trend_candidates(lists, metric, state.config)
     end
   end
 
   defp changepoint_candidates(state, metric) do
-    case pull(state, metric, state.config.analysis_window) do
+    case pull(state, metric, state.config.analysis_window, state.config.resolution) do
       :empty -> []
       lists -> Analysis.changepoint_candidates(lists)
     end
@@ -134,7 +137,8 @@ defmodule MobiusSmarts.Sweeper do
   end
 
   defp refit(state, metric, key, now) do
-    with lists when lists != :empty <- pull(state, metric, state.config.analysis_window),
+    with lists when lists != :empty <-
+           pull(state, metric, state.config.analysis_window, state.config.resolution),
          {:ok, fresh} <-
            Analysis.fit_baseline(lists,
              min_windows: state.config.min_baseline_windows,
@@ -149,7 +153,7 @@ defmodule MobiusSmarts.Sweeper do
   defp fit_novelty(state) do
     series_by_key =
       for metric <- state.config.watch,
-          lists = pull(state, metric, state.config.analysis_window),
+          lists = pull(state, metric, state.config.analysis_window, state.config.resolution),
           lists != :empty do
         {Config.Metric.key(metric), lists}
       end
@@ -167,9 +171,10 @@ defmodule MobiusSmarts.Sweeper do
     Enum.filter(Board.findings(board), &({&1.metric, &1.tags} == key))
   end
 
-  defp pull(%{config: config}, metric, window) do
+  defp pull(%{config: config}, metric, window, resolution) do
     case config.source.summary_series(metric.name, metric.tags,
            last: window,
+           resolution: resolution,
            mobius_instance: config.mobius_instance
          ) do
       :empty -> :empty

@@ -77,6 +77,15 @@ defmodule MobiusSmarts.SourceTest do
     end
   end
 
+  describe "summary_series/3" do
+    test "raises without a stated :resolution — guessing the RRD tier is gone" do
+      # The check fires before any Mobius call, so no instance is needed.
+      assert_raise ArgumentError, ~r/needs a :resolution/, fn ->
+        Source.summary_series("cpu.temp", %{}, last: {2, :hour})
+      end
+    end
+  end
+
   describe "resample_windows/2" do
     # Helper: the summary window Mobius would compute from these raw reports.
     defp window_of(timestamp, values) do
@@ -111,7 +120,7 @@ defmodule MobiusSmarts.SourceTest do
       assert_in_delta merged.std_dev, expected.std_dev, 1.0e-9
     end
 
-    test ":auto merges mixed-tier windows into buckets of the coarsest tier" do
+    test "a stated resolution merges finer-cadence windows into its buckets" do
       # The Mobius.Data.summary_windows/3 shape for a query spanning more
       # than the RRD seconds archive: minute-cadence windows trailing into
       # second-cadence ones for the freshest stretch.
@@ -121,31 +130,13 @@ defmodule MobiusSmarts.SourceTest do
       second_windows =
         for i <- 1..10, do: window_of(900 + i, [20.0])
 
-      resampled = Source.resample_windows(minute_windows ++ second_windows, :auto)
+      resampled = Source.resample_windows(minute_windows ++ second_windows, {1, :minute})
 
       assert Enum.map(resampled, & &1.timestamp) == [660, 720, 780, 840, 900, 910]
       # The minute windows pass through untouched...
       assert Enum.take(resampled, 5) == minute_windows
       # ...and the second-cadence tail merges into one trailing bucket.
       assert List.last(resampled) == window_of(910, List.duplicate(20.0, 10))
-    end
-
-    test ":auto ignores an isolated outage step when picking the cadence" do
-      windows =
-        for ts <- [60, 120, 180, 7380, 7440, 7500], do: window_of(ts, [1.0, 2.0])
-
-      # Steps snap to [60, 60, 3600, 60, 60]: the 2-hour outage never
-      # repeats back-to-back, so the cadence stays one minute and the
-      # windows pass through unchanged.
-      assert Source.resample_windows(windows, :auto) == windows
-    end
-
-    test ":auto passes through short or no-agreeing-cadence series" do
-      short = [window_of(1, [1.0]), window_of(2, [2.0])]
-      assert Source.resample_windows(short, :auto) == short
-
-      no_pair = [window_of(60, [1.0]), window_of(120, [2.0]), window_of(3720, [3.0])]
-      assert Source.resample_windows(no_pair, :auto) == no_pair
     end
 
     test "windows on a bucket boundary close that bucket, not the next" do

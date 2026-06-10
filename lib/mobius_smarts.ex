@@ -36,14 +36,23 @@ defmodule MobiusSmarts do
              [metric: "disk.used_percent", ceiling: 95.0],
              [metric: "cpu.temp_c", ceiling: 85.0]
            ],
-           false_alarm_budget: {1, :week}
+           # The windows every detector operates on — name the Mobius
+           # RRD tier you monitor at; this is the unit behind every
+           # window-counted option and the false-alarm math.
+           resolution: {1, :minute},
+           # Tolerate about one false alarm per week, instance-wide.
+           false_alarm_every: {1, :week},
+           # Ceilings opt into ETA projections, which fit at a coarser
+           # cadence over the (default 24-hour) trend window.
+           trend_resolution: {1, :hour}
          ]}
       ]
 
   With no `:config` option, configuration is read from the
   `:mobius_smarts` application environment (same keys). Pass `:name`
   and an explicit `:config` to run several instances side by side.
-  See `MobiusSmarts.Config` for every key and its default.
+  See `MobiusSmarts.Config` for every key; the derived thresholds are
+  logged once at startup, so the calibration is never a mystery.
 
   ## What happens, automatically
 
@@ -63,7 +72,7 @@ defmodule MobiusSmarts do
   hallucinate continuity across a reboot.
 
   Detection thresholds are not configured per detector — they derive
-  from the single `:false_alarm_budget` via each detector's
+  from the single `:false_alarm_every` budget via each detector's
   average-run-length math (`MobiusSmarts.Calibrate`).
 
   ## Findings and health
@@ -108,7 +117,9 @@ defmodule MobiusSmarts do
 
   use Supervisor
 
-  alias MobiusSmarts.{Board, Config, Sweeper, Watcher}
+  alias MobiusSmarts.{Board, Calibrate, Config, Sweeper, Watcher}
+
+  require Logger
 
   @doc """
   Start a monitoring instance.
@@ -134,6 +145,8 @@ defmodule MobiusSmarts do
 
   @impl Supervisor
   def init({name, config}) do
+    log_calibration(name, config)
+
     children = [
       {Board, name: name, config: config},
       {Watcher, name: name, config: config},
@@ -143,6 +156,20 @@ defmodule MobiusSmarts do
     # The Board owns the ETS table; if it goes, its dependents restart
     # too and the world is rebuilt from the Mobius-persisted RRD.
     Supervisor.init(children, strategy: :rest_for_one)
+  end
+
+  # One line stating what the budget works out to, so nobody has to
+  # reverse-engineer the threshold math to know what they configured.
+  defp log_calibration(name, config) do
+    calib = Calibrate.for_config(config)
+    streams = 4 * length(config.watch) + if Config.novelty?(config), do: 1, else: 0
+
+    Logger.info(
+      "MobiusSmarts #{inspect(name)}: false_alarm_every #{inspect(config.false_alarm_every)} " <>
+        "over #{streams} alarm streams at #{inspect(config.resolution)} windows — " <>
+        "per-stream ARL #{round(calib.arl)} windows, X̄/EWMA limit " <>
+        "#{Float.round(calib.jump_limit, 2)}σ, CUSUM h #{Float.round(calib.cusum_h, 2)}σ"
+    )
   end
 
   @doc """

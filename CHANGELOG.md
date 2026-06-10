@@ -39,13 +39,22 @@ Drift and Shift accept the baseline map from `Jump.baseline/3` directly
 
 An optional supervision tree over the pure layers: polls Mobius on an
 interval, runs the detector stack, and maintains findings and an
-aggregate health level. One `:watch` list and one `:false_alarm_budget`;
-every detector threshold derives from the budget via its own
-average-run-length math (`MobiusSmarts.Calibrate`), baselines are fitted
-from the device's own stored history, and configuration is validated
-with pointed errors at startup. Findings carry onset, a cross-detector
-`concern` ratio, evidence, and a human message; lifecycle and health
-events emit via telemetry.
+aggregate health level. Configuration states facts and tolerances
+explicitly — nothing is inferred from the data: `:watch` (the metrics),
+`:resolution` (the RRD window cadence every detector operates on, and
+the unit of the false-alarm math), `:false_alarm_every` (the budget;
+`{1, :week}` is one false alarm a week), and `:trend_resolution` when
+ceilings/floors opt into ETA projections. Every detector threshold
+derives from the budget via its own average-run-length math
+(`MobiusSmarts.Calibrate`), the derived numbers are logged once at
+startup, baselines are fitted from the device's own stored history, and
+configuration is validated with pointed errors at startup (including
+that `:analysis_window` can hold `:min_baseline_windows` windows of
+`:resolution` width). ETA projections are additionally gated on the
+fitted series spanning at least half of `:trend_window`, so a 7-day
+forecast is never extrapolated from an hour of data. Findings carry
+onset, a cross-detector `concern` ratio, evidence, and a human message;
+lifecycle and health events emit via telemetry.
 
 ### Source — `MobiusSmarts.Source`
 
@@ -54,15 +63,18 @@ reports), plain numeric series, and DDSketch reconstruction, plus pure
 converters for tests and replays.
 
 `summary_series/3` resamples Mobius's mixed-cadence RRD windows to a
-uniform cadence (`resolution: :auto` by default, explicit duration or
-`:native` available; `resample_windows/2` is the pure form). Mobius
+required, explicitly stated `resolution:` (a duration, or `:native` for
+the raw windows; `resample_windows/2` is the pure form — merging is
+exact, recombining the sum / sum-of-squares / count deltas). Mobius
 deltas consecutive snapshots across all four RRD archives at once, so
 without this any query spanning more than the seconds archive fed the
 detectors second-cadence windows for the freshest minutes and
 minute-cadence behind them — the runtime read every archive-tier
 boundary as a reporting gap, re-anchored to the ~2-minute
 second-resolution tail (single-report windows, no dispersion), and
-every watched metric sat in `:learning` forever.
+every watched metric sat in `:learning` forever. The cadence is never
+inferred from the data: stating the tier you monitor at is part of the
+configuration contract.
 
 ### Pre-release review history
 

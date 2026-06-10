@@ -13,21 +13,20 @@ defmodule MobiusSmarts.WatcherTest do
 
   alias MobiusSmarts.{Analysis, Board, Calibrate, Config, StubSource}
 
-  # The deliberate stub cadence (60s windows) never matches the
-  # millisecond tick interval these tests run at, so every test here
-  # legitimately triggers the cadence-mismatch warning.
+  # Keep incidental runtime logging (the cadence test deliberately
+  # provokes a warning) out of passing-test output.
   @moduletag :capture_log
 
   defp seeded(seed), do: :rand.seed(:exsss, {seed, seed * 7, seed * 13})
   defp noise(sigma), do: sigma * :rand.normal()
 
-  defp windows(values, now) do
+  defp windows(values, now, cadence \\ 60) do
     n = length(values)
 
     values
     |> Enum.with_index()
     |> Enum.map(fn {avg, i} ->
-      %{timestamp: now - (n - i) * 60, average: avg, std_dev: 1.0, reports: 30}
+      %{timestamp: now - (n - i) * cadence, average: avg, std_dev: 1.0, reports: 30}
     end)
   end
 
@@ -41,6 +40,11 @@ defmodule MobiusSmarts.WatcherTest do
       watch: watch,
       source: StubSource,
       mobius_instance: instance,
+      # Staged windows are 60s apart; gap detection and staleness key
+      # off :resolution, so it must match. :interval stays a fast test
+      # clock — it is scheduling-only.
+      resolution: {1, :minute},
+      false_alarm_every: {1, :week},
       interval: 25,
       sweep_interval: 60_000,
       min_baseline_windows: 60,
@@ -153,11 +157,12 @@ defmodule MobiusSmarts.WatcherTest do
                  @fresh_tmp_last
                ])
 
-      # cpu lags one 60s window behind net/tmp — still live (well
-      # inside stale_after), but its latest window is not the same
-      # moment the model's aligned rows describe.
+      # cpu lags two 60s windows behind net/tmp — still live (inside
+      # stale_after = gap_factor x resolution), but more than one
+      # :resolution window from the others: not the same moment the
+      # model's aligned rows describe.
       StubSource.stage(instance, %{
-        {"cpu", %{}} => windows(List.replace_at(cpu, -1, @stale_cpu_last), now - 60),
+        {"cpu", %{}} => windows(List.replace_at(cpu, -1, @stale_cpu_last), now - 120),
         {"net", %{}} => windows(List.replace_at(net, -1, @fresh_net_last), now),
         {"tmp", %{}} => windows(List.replace_at(tmp, -1, @fresh_tmp_last), now)
       })
@@ -176,16 +181,18 @@ defmodule MobiusSmarts.WatcherTest do
   end
 
   describe "cadence calibration warning" do
-    test "warns once per metric when the measured cadence disagrees with :interval", ctx do
+    test "warns once per metric when the measured cadence disagrees with :resolution", ctx do
       seeded(203)
       {name, instance, config} = instance_opts(ctx, ["n7.cadence"])
       now = System.system_time(:second)
 
-      # 60s-cadence windows against a 25ms tick interval: the
-      # false-alarm budget was converted to windows via :interval, so
-      # every threshold is miscalibrated by roughly the ratio.
+      # 20s-cadence windows against resolution: {1, :minute} — Mobius is
+      # not storing data at the configured resolution, so gap detection
+      # and the false-alarm calibration are off by roughly 3x. (Finer
+      # than :resolution, so no step ever reads as a reporting gap and
+      # the baseline still fits.)
       healthy = Enum.map(1..120, fn _ -> 40.0 + noise(0.5) end)
-      StubSource.stage(instance, %{{"n7.cadence", %{}} => windows(healthy, now)})
+      StubSource.stage(instance, %{{"n7.cadence", %{}} => windows(healthy, now, 20)})
 
       log =
         capture_log(fn ->
@@ -200,7 +207,7 @@ defmodule MobiusSmarts.WatcherTest do
         end)
 
       assert log =~ "n7.cadence"
-      assert log =~ "false-alarm budget is calibrated against :interval"
+      assert log =~ "does not seem to store data at the configured resolution"
 
       warnings = log |> String.split("\n") |> Enum.count(&(&1 =~ "n7.cadence"))
       assert warnings == 1

@@ -5,30 +5,57 @@ defmodule MobiusSmarts.Config do
 
   Built from the `:mobius_smarts` application environment by default,
   or from an explicit keyword list (so several instances can run
-  side by side). See `MobiusSmarts` for the full story; the headline
-  keys are:
+  side by side). See `MobiusSmarts` for the full story.
+
+  Three keys are required — they are statements of fact and tolerance
+  that the runtime refuses to guess:
 
   - `:watch` — the metrics to monitor (see `MobiusSmarts.Config.Metric`).
-  - `:false_alarm_budget` — how often the whole instance may cry wolf
-    on a healthy device, e.g. `{1, :week}`. Every detector threshold
-    is derived from this one number (`MobiusSmarts.Calibrate`).
-  - `:mobius_instance` — which Mobius instance to read.
+  - `:resolution` — the width of the summary windows every detector
+    operates on, e.g. `{1, :minute}`. Mobius's RRD stores several
+    resolutions simultaneously (by default 120 seconds of
+    second-resolution data, 120 minutes of minute-resolution, 48
+    hours of hour-resolution, 60 days of day-resolution); this names
+    the tier you mean to monitor, and the runtime reads at exactly
+    this cadence (`MobiusSmarts.Source.resample_windows/2` merges
+    finer-grained stretches into these buckets). It is also the unit
+    behind every window-counted option below and behind the
+    false-alarm math. Pick a tier whose retention covers
+    `:analysis_window` — `{1, :minute}` pairs with the default
+    two-hour window and Mobius's default retention.
+  - `:false_alarm_every` — the false-alarm budget: on a healthy
+    device the whole instance may cry wolf about once per this
+    duration. `{1, :week}` is one false alarm a week; `{2, :week}` is
+    one every two weeks. Every detector threshold derives from this
+    one tolerance and `:resolution` (`MobiusSmarts.Calibrate`).
 
-  Everything else has defaults stated in sigma units, windows, or
-  durations. A duration is a `{count, unit}` tuple with a positive
-  integer count and a unit of `:second`, `:minute`, `:hour`, `:day`,
-  or `:week` — or a raw positive integer of milliseconds (handy for
-  fast test clocks). The tradeoffs:
+  And one more becomes required when you opt into ETA projections:
 
-  - `:interval` (default `{1, :minute}`) — tick cadence; should match
-    the Mobius RRD resolution you want to monitor at.
+  - `:trend_resolution` — window width for the Trend sweep's slope
+    and time-to-threshold fits over `:trend_window`. Required when
+    any watch entry declares a `:ceiling` or `:floor`; `{1, :hour}`
+    pairs with the default 24-hour `:trend_window` (and Mobius's
+    48-hour hour-resolution retention).
+
+  Everything else has defaults stated in sigma units, windows (of
+  `:resolution` width), or durations. A duration is a `{count, unit}`
+  tuple with a positive integer count and a unit of `:second`,
+  `:minute`, `:hour`, `:day`, or `:week` — or a raw positive integer
+  of milliseconds (handy for fast test clocks). The tradeoffs:
+
+  - `:mobius_instance` (default `:mobius`) — which Mobius instance to
+    read.
+  - `:interval` (defaults to `:resolution`) — how often the fast
+    detectors re-scan. Scheduling only: no detector math depends on
+    it, and ticking faster than `:resolution` cannot surface anything
+    new. The exception that wants it is a fast test clock.
   - `:sweep_interval` (default `{1, :hour}`) — cadence of the slow
     detectors (Trend/ETA, Shape, Changepoint) and of baseline upkeep.
   - `:analysis_window` (default `{2, :hour}`) — how much trailing
     history each tick re-scans. This bounds the slowest level change
     the tick detectors can confirm; slower-than-window creep is the
-    Trend sweep's job. The default stays inside Mobius's default
-    minute-resolution retention.
+    Trend sweep's job. Must hold at least `:min_baseline_windows`
+    windows of `:resolution` width, or learning could never complete.
   - `:trend_window` (default `{24, :hour}`) — history for the Trend
     sweep's slope and ETA projections.
   - `:warn_horizon` / `:critical_horizon` (defaults `{7, :day}` /
@@ -105,11 +132,13 @@ defmodule MobiusSmarts.Config do
   @type t() :: %__MODULE__{
           mobius_instance: atom(),
           source: module(),
+          resolution: duration(),
+          trend_resolution: duration() | nil,
           interval: duration(),
           sweep_interval: duration(),
           analysis_window: duration(),
           trend_window: duration(),
-          false_alarm_budget: duration(),
+          false_alarm_every: duration(),
           warn_horizon: duration(),
           critical_horizon: duration(),
           min_baseline_windows: pos_integer(),
@@ -124,11 +153,13 @@ defmodule MobiusSmarts.Config do
 
   defstruct mobius_instance: :mobius,
             source: MobiusSmarts.Source,
-            interval: {1, :minute},
+            resolution: nil,
+            trend_resolution: nil,
+            interval: nil,
             sweep_interval: {1, :hour},
             analysis_window: {2, :hour},
             trend_window: {24, :hour},
-            false_alarm_budget: {1, :week},
+            false_alarm_every: nil,
             warn_horizon: {7, :day},
             critical_horizon: {1, :day},
             min_baseline_windows: 60,
@@ -141,11 +172,12 @@ defmodule MobiusSmarts.Config do
             watch: []
 
   @duration_keys [
+    :resolution,
     :interval,
     :sweep_interval,
     :analysis_window,
     :trend_window,
-    :false_alarm_budget,
+    :false_alarm_every,
     :warn_horizon,
     :critical_horizon,
     :refit_interval
@@ -160,20 +192,27 @@ defmodule MobiusSmarts.Config do
 
   A bad value raises at build time, naming the key, the value
   received, and the valid range — rather than detonating later inside
-  a detector at boot.
+  a detector at boot. `:resolution` and `:false_alarm_every` are
+  required; `:trend_resolution` is required when any watch entry
+  declares a `:ceiling` or `:floor`.
 
   ## Examples
 
-      iex> config = MobiusSmarts.Config.new!(watch: ["cpu.temp", [metric: "disk.pct", ceiling: 95]])
-      iex> [%MobiusSmarts.Config.Metric{name: "cpu.temp"}, disk] = config.watch
-      iex> {disk.name, disk.ceiling}
-      {"disk.pct", 95}
+      iex> config =
+      ...>   MobiusSmarts.Config.new!(
+      ...>     watch: ["cpu.temp"],
+      ...>     resolution: {1, :minute},
+      ...>     false_alarm_every: {1, :week}
+      ...>   )
+      iex> [%MobiusSmarts.Config.Metric{name: "cpu.temp"}] = config.watch
+      iex> {config.resolution, config.interval}
+      {{1, :minute}, {1, :minute}}
 
       iex> MobiusSmarts.Config.new!(watch: [], wat: 1)
       ** (ArgumentError) unknown MobiusSmarts config keys: [:wat]
 
-      iex> MobiusSmarts.Config.new!(ewma_lambda: 1.5)
-      ** (ArgumentError) invalid MobiusSmarts config: :ewma_lambda must be a number in (0, 1], got: 1.5
+      iex> MobiusSmarts.Config.new!(watch: [], false_alarm_every: {1, :week})
+      ** (ArgumentError) MobiusSmarts config is missing :resolution — the width of the summary windows every detector operates on. Name the Mobius RRD tier you mean to monitor; {1, :minute} pairs with the default two-hour :analysis_window.
   """
   @spec new!(keyword()) :: t()
   def new!(opts) when is_list(opts) do
@@ -191,8 +230,39 @@ defmodule MobiusSmarts.Config do
     end
 
     config = %{config | watch: Enum.map(config.watch, &normalize_metric/1)}
+    require_stated!(config)
+    config = %{config | interval: config.interval || config.resolution}
     validate!(config)
     config
+  end
+
+  # The keys the runtime refuses to guess: stating them is the whole
+  # contract, so their absence gets a teaching error, not a default.
+  defp require_stated!(config) do
+    if is_nil(config.resolution) do
+      raise ArgumentError,
+            "MobiusSmarts config is missing :resolution — the width of the summary " <>
+              "windows every detector operates on. Name the Mobius RRD tier you mean " <>
+              "to monitor; {1, :minute} pairs with the default two-hour :analysis_window."
+    end
+
+    if is_nil(config.false_alarm_every) do
+      raise ArgumentError,
+            "MobiusSmarts config is missing :false_alarm_every — the false-alarm " <>
+              "budget. {1, :week} tolerates about one false alarm per week across " <>
+              "the whole instance; every detector threshold is derived from it."
+    end
+
+    if is_nil(config.trend_resolution) and
+         Enum.any?(config.watch, &(&1.ceiling != nil or &1.floor != nil)) do
+      raise ArgumentError,
+            "MobiusSmarts config is missing :trend_resolution — watch entries with a " <>
+              ":ceiling or :floor enable the Trend sweep's ETA projections, which need " <>
+              "a stated window width over :trend_window. {1, :hour} pairs with the " <>
+              "default 24-hour :trend_window."
+    end
+
+    :ok
   end
 
   @doc """
@@ -236,7 +306,9 @@ defmodule MobiusSmarts.Config do
 
   defp validate!(%__MODULE__{} = c) do
     Enum.each(@duration_keys, &validate_duration!(&1, Map.fetch!(c, &1)))
+    validate_trend_resolution!(c)
     validate_budget!(c)
+    validate_learnable!(c)
 
     check!(:mobius_instance, c.mobius_instance, is_atom(c.mobius_instance), "an atom")
     check!(:source, c.source, is_atom(c.source), "a module")
@@ -305,15 +377,44 @@ defmodule MobiusSmarts.Config do
     )
   end
 
-  # A budget under one tick clamps every detector threshold to its
+  defp validate_trend_resolution!(%__MODULE__{trend_resolution: nil}), do: :ok
+
+  defp validate_trend_resolution!(%__MODULE__{} = c) do
+    validate_duration!(:trend_resolution, c.trend_resolution)
+
+    if ms(c.trend_resolution) > ms(c.trend_window) do
+      raise ArgumentError,
+            "invalid MobiusSmarts config: :trend_resolution (#{inspect(c.trend_resolution)}) " <>
+              "must fit inside :trend_window (#{inspect(c.trend_window)})"
+    end
+
+    :ok
+  end
+
+  # A budget under one window clamps every detector threshold to its
   # floor (Calibrate's ARL bottoms out at 2), so the instance would
   # alarm near-constantly while looking healthy on paper.
-  defp validate_budget!(%__MODULE__{false_alarm_budget: budget, interval: interval}) do
-    if ms(budget) < ms(interval) do
+  defp validate_budget!(%__MODULE__{false_alarm_every: budget, resolution: resolution}) do
+    if ms(budget) < ms(resolution) do
       raise ArgumentError,
-            "invalid MobiusSmarts config: :false_alarm_budget (#{inspect(budget)}) must be " <>
-              "at least one :interval (#{inspect(interval)}); a sub-tick budget clamps every " <>
-              "detector threshold to its floor"
+            "invalid MobiusSmarts config: :false_alarm_every (#{inspect(budget)}) must be " <>
+              "at least one :resolution window (#{inspect(resolution)}); a sub-window budget " <>
+              "clamps every detector threshold to its floor"
+    end
+  end
+
+  # Learning needs :min_baseline_windows healthy windows inside one
+  # analysis window — if the window can't even hold that many, every
+  # metric would sit in :learning forever.
+  defp validate_learnable!(%__MODULE__{} = c) do
+    capacity = div(ms(c.analysis_window), ms(c.resolution))
+
+    if capacity < c.min_baseline_windows do
+      raise ArgumentError,
+            "invalid MobiusSmarts config: :analysis_window (#{inspect(c.analysis_window)}) " <>
+              "holds only #{capacity} windows of :resolution #{inspect(c.resolution)} — " <>
+              "fewer than :min_baseline_windows (#{c.min_baseline_windows}), so no baseline " <>
+              "could ever be fitted"
     end
   end
 

@@ -19,6 +19,9 @@ defmodule MobiusSmarts.SweeperTest do
         ],
         source: StubSource,
         mobius_instance: instance,
+        # The staged windows are spaced one minute apart.
+        resolution: {1, :minute},
+        false_alarm_every: {1, :week},
         # Long enough that the scheduled sweep never fires on its own;
         # the test drives sweeps explicitly.
         sweep_interval: {1, :hour},

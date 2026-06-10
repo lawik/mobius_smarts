@@ -22,8 +22,13 @@ library implements that detector stack as pure functions over Nx tensors:
 ```elixir
 alias MobiusSmarts.{Detect, Source}
 
+# Mobius stores several RRD resolutions at once; you state the tier
+# you mean to read at — nothing is inferred from the data.
 %{average: avgs, std_dev: stds, reports: counts} =
-  Source.summary_series("vm.memory.used_percent", %{}, last: {7, :day})
+  Source.summary_series("vm.memory.used_percent", %{},
+    last: {2, :day},
+    resolution: {1, :hour}
+  )
 
 baseline = Detect.Jump.baseline(avgs, stds, counts)
 
@@ -64,7 +69,14 @@ children = [
        [metric: "disk.used_percent", ceiling: 95.0],
        [metric: "cpu.temp_c", ceiling: 85.0]
      ],
-     false_alarm_budget: {1, :week}
+     # The Mobius RRD tier the detectors operate on, and the unit
+     # behind the false-alarm math — stated, never inferred.
+     resolution: {1, :minute},
+     # Tolerate about one false alarm per week, instance-wide.
+     false_alarm_every: {1, :week},
+     # Ceilings opt into ETA projections, fitted at a coarser tier
+     # over the (default 24-hour) trend window.
+     trend_resolution: {1, :hour}
    ]}
 ]
 
@@ -73,12 +85,14 @@ MobiusSmarts.status()
 ```
 
 There are no per-detector thresholds to tune: the configuration states one
-false-alarm budget ("this device may cry wolf about once a week") and every
-detector's threshold is derived from it via that detector's
-average-run-length math; baselines are fitted from the device's own stored
-history. Findings surface through `MobiusSmarts.status/0` and telemetry
-events — what to do with them (alarms, notifications, persistence) is the
-host app's call. The `MobiusSmarts` moduledoc has the full story: learning,
+false-alarm budget (`false_alarm_every: {1, :week}` — "this device may cry
+wolf about once a week") and the window cadence it is counted in
+(`resolution:`), and every detector's threshold is derived from those two
+via that detector's average-run-length math; the derived numbers are logged
+once at startup. Baselines are fitted from the device's own stored history.
+Findings surface through `MobiusSmarts.status/0` and telemetry events —
+what to do with them (alarms, notifications, persistence) is the host
+app's call. The `MobiusSmarts` moduledoc has the full story: learning,
 finding lifecycle, health levels, telemetry.
 
 ## Installation
