@@ -32,6 +32,18 @@ defmodule MobiusSmarts.Detect.Jump do
   correction (S underestimates sigma for small n; `c4` is computed with
   the `(4n-4)/(4n-3)` approximation, accurate to ~0.1% for n ≥ 4).
 
+  The wobble band's *lower* limit (spread collapsing — a flat, stuck
+  signal) assumes the process normally carries noise in every window.
+  Zero-inflated metrics break that assumption: an idle device's run
+  queue is exactly 0 for whole windows at a time, with occasional
+  bursts inflating the pooled sigma, so the textbook lower limit sits
+  above zero and every healthy idle window would alarm. The charts
+  therefore arm the lower limit only when the baseline pool itself
+  contained no zero-spread window (`baseline/3` records this as
+  `:sd_floor`; in phase I the scanned windows speak for themselves) —
+  if flat windows are part of normal life, a flat window is not
+  evidence.
+
   The Mobius summary window — average, std_dev, count — *is* the
   subgroup format these charts were designed for. No adaptation, no
   approximation.
@@ -120,17 +132,29 @@ defmodule MobiusSmarts.Detect.Jump do
     counts = counts |> broadcast_counts(n) |> validate_counts!()
     limit = Keyword.get(opts, :limit, 3.0) * 1.0
 
-    {grand_mean, pooled_sigma} =
+    {grand_mean, pooled_sigma, sd_floor} =
       case Keyword.get(opts, :baseline) do
-        {gm, ps} -> {gm * 1.0, ps * 1.0}
-        %{target: gm, sigma_reports: ps} -> {gm * 1.0, ps * 1.0}
-        nil -> estimate_baseline(averages, std_devs, counts)
+        # Explicit tuples are the textbook S-chart contract: both
+        # limits armed, the caller owns the zero-inflation question.
+        {gm, ps} -> {gm * 1.0, ps * 1.0, 1.0}
+        %{target: gm, sigma_reports: ps} = baseline -> {gm * 1.0, ps * 1.0, sd_floor(baseline)}
+        nil -> phase1_baseline(averages, std_devs, counts)
       end
+
+    low_armed = if sd_floor > 0.0, do: 1.0, else: 0.0
 
     # Scalars enter the defn kernel as f64 tensors — bare floats would
     # be wrapped as f32 by Nx.
     {jump_ucl, jump_lcl, jumps, wobble_ucl, wobble_lcl, wobbles} =
-      charts(averages, std_devs, counts, f64(grand_mean), f64(pooled_sigma), f64(limit))
+      charts(
+        averages,
+        std_devs,
+        counts,
+        f64(grand_mean),
+        f64(pooled_sigma),
+        f64(limit),
+        f64(low_armed)
+      )
 
     %{
       grand_mean: grand_mean,
@@ -166,12 +190,18 @@ defmodule MobiusSmarts.Detect.Jump do
 
   `sigma_avg` needs at least 2 windows (it is `0.0` below that); use a
   healthy stretch of hundreds.
+
+  The map also carries `:sd_floor` — the smallest within-window spread
+  among the pool's dispersion-carrying windows. `scan/4` arms the
+  wobble chart's lower (stuck-signal) limit only when it is positive:
+  a pool containing flat windows says flat is normal here (see the
+  zero-inflation note in the moduledoc).
   """
   @spec baseline(
           Nx.Tensor.t() | [number()],
           Nx.Tensor.t() | [number()],
           Nx.Tensor.t() | [number()] | pos_integer()
-        ) :: %{target: float(), sigma_reports: float(), sigma_avg: float()}
+        ) :: %{target: float(), sigma_reports: float(), sigma_avg: float(), sd_floor: float()}
   def baseline([], _std_devs, _counts) do
     raise ArgumentError,
           "cannot estimate a baseline from an empty series — MobiusSmarts.Source " <>
@@ -191,8 +221,40 @@ defmodule MobiusSmarts.Detect.Jump do
         0.0
       end
 
-    %{target: grand_mean, sigma_reports: pooled_sigma, sigma_avg: sigma_avg}
+    %{
+      target: grand_mean,
+      sigma_reports: pooled_sigma,
+      sigma_avg: sigma_avg,
+      sd_floor: chartable_sd_floor(std_devs, counts)
+    }
   end
+
+  # The smallest within-window spread among windows that carry
+  # dispersion information. Zero means flat windows are part of this
+  # metric's normal life, so the wobble chart's lower limit (the
+  # stuck-signal alarm) must stay disarmed.
+  defp chartable_sd_floor(std_devs, counts) do
+    chartable = Nx.greater_equal(counts, 2)
+
+    if Nx.to_number(Nx.any(chartable)) == 1 do
+      chartable
+      |> Nx.select(std_devs, Nx.Constants.infinity({:f, 64}))
+      |> Nx.reduce_min()
+      |> Nx.to_number()
+    else
+      0.0
+    end
+  end
+
+  defp phase1_baseline(averages, std_devs, counts) do
+    {grand_mean, pooled_sigma} = estimate_baseline(averages, std_devs, counts)
+    {grand_mean, pooled_sigma, chartable_sd_floor(std_devs, counts)}
+  end
+
+  # Baseline maps predating :sd_floor (or hand-built ones) keep the
+  # textbook armed-low-limit behavior.
+  defp sd_floor(%{sd_floor: floor}), do: floor * 1.0
+  defp sd_floor(_baseline), do: 1.0
 
   defp estimate_baseline(averages, std_devs, counts) do
     total = Nx.sum(counts)
@@ -222,7 +284,7 @@ defmodule MobiusSmarts.Detect.Jump do
   end
 
   # Both charts as one traced graph over the window series.
-  defnp charts(averages, std_devs, counts, grand_mean, pooled_sigma, limit) do
+  defnp charts(averages, std_devs, counts, grand_mean, pooled_sigma, limit, low_armed) do
     # Jump side: limits scale with subgroup size.
     jump_half = limit * pooled_sigma * Nx.rsqrt(counts)
     jump_ucl = grand_mean + jump_half
@@ -231,10 +293,12 @@ defmodule MobiusSmarts.Detect.Jump do
 
     # Wobble side: E[S] = c4·sigma, SD[S] = sigma·sqrt(1 - c4²), with
     # c4(n) ≈ (4n - 4) / (4n - 3) (exact form uses gamma functions).
+    # The lower limit is zeroed (disarmed) when flat windows are normal
+    # for this metric — see the moduledoc on zero-inflated metrics.
     c4 = (counts * 4.0 - 4.0) / (counts * 4.0 - 3.0)
     spread = Nx.sqrt(1.0 - c4 * c4)
     wobble_ucl = pooled_sigma * (c4 + limit * spread)
-    wobble_lcl = Nx.max(pooled_sigma * (c4 - limit * spread), 0.0)
+    wobble_lcl = Nx.max(pooled_sigma * (c4 - limit * spread), 0.0) * low_armed
 
     chartable = counts >= 2
     wobbles = (std_devs > wobble_ucl or std_devs < wobble_lcl) and chartable

@@ -253,10 +253,12 @@ defmodule MobiusSmarts.AnalysisTest do
       refute Enum.find(candidates, &(&1.kind == :jumped))
     end
 
-    test "a collapsed spread (stuck sensor) wobbles with a bounded concern" do
+    test "a collapsed spread (stuck sensor) raises :flatlined with a bounded concern" do
       seeded(26)
       # Healthy spread throughout, then the last window goes perfectly
-      # flat: below the wobble band's lower limit with std = 0.0.
+      # flat: below the wobble band's lower limit with std = 0.0. The
+      # baseline pool carried spread in every window, so the lower
+      # limit is armed and the collapse really is anomalous.
       stds = List.duplicate(1.0, 119) ++ [0.0]
       values = Enum.map(stds, fn s -> 50.0 + noise(s / :math.sqrt(30)) end)
 
@@ -270,13 +272,39 @@ defmodule MobiusSmarts.AnalysisTest do
       candidates =
         Analysis.tick_candidates(lists, healthy_baseline(50.0, 0.2), calib(), config())
 
-      assert wobbling = Enum.find(candidates, &(&1.kind == :wobbling))
-      assert wobbling.severity in [:warning, :critical]
+      assert flatlined = Enum.find(candidates, &(&1.kind == :flatlined))
+      assert flatlined.severity in [:warning, :critical]
+      assert flatlined.message =~ "stuck-signal"
       # Concern must stay comparable to other detectors' concerns — a
       # ratio against std would explode toward 1e12 here and poison the
       # Board's max-concern aggregation.
-      assert wobbling.concern >= 1.0
-      assert wobbling.concern < 100.0
+      assert flatlined.concern >= 1.0
+      assert flatlined.concern < 100.0
+    end
+
+    test "zero spread stays quiet for a metric whose baseline includes flat windows" do
+      # The zero-inflated case (an idle run queue): healthy history is
+      # mostly perfectly-flat windows with occasional bursts. The
+      # textbook lower S-limit would sit above zero and alarm on every
+      # idle window; the recorded sd_floor of 0.0 disarms it.
+      stds = Enum.map(1..119, fn i -> if rem(i, 10) == 0, do: 0.8, else: 0.0 end) ++ [0.0]
+      avgs = Enum.map(stds, fn s -> if s > 0.0, do: 0.1, else: 0.0 end)
+
+      lists = %{
+        ts: Enum.map(0..119, &(1_700_000_000 + &1 * 60)),
+        avg: avgs,
+        std: stds,
+        reports: List.duplicate(30, 120)
+      }
+
+      baseline =
+        MobiusSmarts.Detect.Jump.baseline(lists.avg, lists.std, lists.reports)
+
+      assert baseline.sd_floor == 0.0
+
+      candidates = Analysis.tick_candidates(lists, baseline, calib(), config())
+
+      refute Enum.find(candidates, &(&1.kind == :flatlined))
     end
   end
 

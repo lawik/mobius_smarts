@@ -11,8 +11,13 @@ in Nx.
 Pure functions over tensors or lists; each module documents its theory,
 tuning knobs, and blind spots.
 
-- `Jump` — Shewhart X̄/S charts with c4 correction: sudden jumps and
-  rising within-window "wobble".
+- `Jump` — Shewhart X̄/S charts with c4 correction: sudden jumps,
+  rising within-window "wobble", and collapsed spread ("flatlined",
+  the stuck-signal signature). The S-chart's lower limit arms only
+  when the baseline pool carried dispersion in every window —
+  zero-inflated metrics (an idle run queue is exactly 0 for whole
+  windows at a time) would otherwise alarm on every healthy idle
+  window (`baseline/3` records the pool's `:sd_floor`).
 - `Drift` — two-sided CUSUM with onset dating; batch scan (reflection
   identity) and O(1)-state streaming form.
 - `Shift` — EWMA chart with exact time-varying limits; batch and

@@ -252,28 +252,45 @@ defmodule MobiusSmarts.Analysis do
         # (1 + lcl/band_half) even at std = 0 — a ratio against std
         # would explode toward 1e12 for a stuck sensor and poison the
         # Board's max-concern aggregation across detectors.
-        concern =
-          if std > ucl do
-            std / max(ucl, 1.0e-12)
-          else
-            band_half = (ucl - lcl) / 2.0
-            1.0 + (lcl - std) / max(band_half, 1.0e-12)
-          end
+        if std > ucl do
+          concern = std / max(ucl, 1.0e-12)
 
-        [
-          %{
-            kind: :wobbling,
-            detector: :jump,
-            class: :condition,
-            severity: severity_from(concern),
-            concern: concern,
-            onset: Enum.at(lists.ts, last),
-            evidence: %{std_dev: std, ucl: ucl, lcl: lcl},
-            message:
-              "within-window spread at #{round2(std)}, outside its band " <>
-                "(#{round2(lcl)}–#{round2(ucl)}) — pre-failure signature"
-          }
-        ]
+          [
+            %{
+              kind: :wobbling,
+              detector: :jump,
+              class: :condition,
+              severity: severity_from(concern),
+              concern: concern,
+              onset: Enum.at(lists.ts, last),
+              evidence: %{std_dev: std, ucl: ucl, lcl: lcl},
+              message:
+                "within-window spread at #{round2(std)}, above its band " <>
+                  "(#{round2(lcl)}–#{round2(ucl)}) — erratic, a pre-failure signature"
+            }
+          ]
+        else
+          band_half = (ucl - lcl) / 2.0
+          concern = 1.0 + (lcl - std) / max(band_half, 1.0e-12)
+
+          # Only reachable when the baseline pool had spread in every
+          # window (Jump disarms the lower limit otherwise), so a
+          # collapse really is anomalous for this metric.
+          [
+            %{
+              kind: :flatlined,
+              detector: :jump,
+              class: :condition,
+              severity: severity_from(concern),
+              concern: concern,
+              onset: Enum.at(lists.ts, last),
+              evidence: %{std_dev: std, ucl: ucl, lcl: lcl},
+              message:
+                "within-window spread collapsed to #{round2(std)}, below its healthy " <>
+                  "floor #{round2(lcl)} — flat, stuck-signal signature"
+            }
+          ]
+        end
       else
         []
       end

@@ -17,6 +17,7 @@ defmodule MobiusSmarts.Watcher do
     :jumped,
     :spiked,
     :wobbling,
+    :flatlined,
     :shifted_up,
     :shifted_down,
     :drifting_up,

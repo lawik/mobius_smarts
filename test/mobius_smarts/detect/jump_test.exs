@@ -36,6 +36,40 @@ defmodule MobiusSmarts.Detect.JumpTest do
       assert_in_delta pooled, 2.0, 1.0e-9
     end
 
+    test "sd_floor is the smallest dispersion-carrying spread; singletons don't count" do
+      # The 0.0 spread belongs to a singleton window (no dispersion
+      # information), so the floor comes from the n >= 2 windows.
+      %{sd_floor: floor} = Jump.baseline([0.0, 0.0, 0.0], [1.0, 0.5, 0.0], [10, 10, 1])
+      assert_in_delta floor, 0.5, 1.0e-9
+
+      %{sd_floor: zero_floor} = Jump.baseline([0.0, 0.0], [1.0, 0.0], [10, 10])
+      assert zero_floor == 0.0
+    end
+
+    test "a zero sd_floor disarms the lower wobble limit — zero-inflated metrics" do
+      # An idle run queue: most windows perfectly flat, occasional
+      # bursts. The textbook lower S-limit sits above zero (n is large
+      # enough for B5 > 0) and would alarm on every healthy idle
+      # window; a baseline whose pool contains flat windows disarms it.
+      avgs = [0.0, 0.1, 0.1, 0.1, 0.1, 0.0]
+      stds = [0.0, 0.4, 0.5, 0.4, 0.45, 0.0]
+      baseline = Jump.baseline(avgs, stds, 18)
+      assert baseline.sd_floor == 0.0
+
+      result = Jump.scan(avgs, stds, 18, baseline: baseline)
+
+      assert result.wobble_lcl |> Nx.to_flat_list() |> Enum.all?(&(&1 == 0.0))
+      assert Nx.to_flat_list(result.wobbles) == [0, 0, 0, 0, 0, 0]
+
+      # The same flat window against an every-window-noisy baseline is
+      # a real stuck-signal alarm: the lower limit stays armed.
+      noisy_baseline = Jump.baseline([0.1, 0.1, 0.1], [0.8, 0.9, 0.85], 18)
+      armed = Jump.scan([0.1, 0.1], [0.85, 0.0], 18, baseline: noisy_baseline)
+
+      assert Nx.to_number(armed.wobble_lcl[1]) > 0.0
+      assert Nx.to_flat_list(armed.wobbles) == [0, 1]
+    end
+
     test "grand mean weights by report count" do
       %{target: grand} = Jump.baseline([10.0, 20.0], [1.0, 1.0], [30, 10])
       assert_in_delta grand, 12.5, 1.0e-9

@@ -26,7 +26,8 @@ defmodule MobiusSmarts.Finding do
   |---|---|---|---|
   | `:jumped` | condition | Jump | latest window far outside the band right now |
   | `:spiked` | observation | Jump | an earlier window jumped, then returned |
-  | `:wobbling` | condition | Jump (S side) | within-window spread off its band |
+  | `:wobbling` | condition | Jump (S side) | within-window spread above its band — erratic |
+  | `:flatlined` | condition | Jump (S side) | spread collapsed below a normally-noisy metric's floor — stuck signal |
   | `:shifted_up/_down` | condition | Shift | level moved and stayed moved |
   | `:drifting_up/_down` | condition | Drift | slow creep confirmed; onset dated |
   | `:approaching_limit` | condition | Trend | heading for a ceiling/floor; ETA attached |
@@ -41,6 +42,7 @@ defmodule MobiusSmarts.Finding do
           :jumped
           | :spiked
           | :wobbling
+          | :flatlined
           | :shifted_up
           | :shifted_down
           | :drifting_up
