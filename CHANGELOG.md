@@ -53,6 +53,17 @@ Mobius data as Nx tensors: per-window summary series (average/std_dev/
 reports), plain numeric series, and DDSketch reconstruction, plus pure
 converters for tests and replays.
 
+`summary_series/3` resamples Mobius's mixed-cadence RRD windows to a
+uniform cadence (`resolution: :auto` by default, explicit duration or
+`:native` available; `resample_windows/2` is the pure form). Mobius
+deltas consecutive snapshots across all four RRD archives at once, so
+without this any query spanning more than the seconds archive fed the
+detectors second-cadence windows for the freshest minutes and
+minute-cadence behind them — the runtime read every archive-tier
+boundary as a reporting gap, re-anchored to the ~2-minute
+second-resolution tail (single-report windows, no dispersion), and
+every watched metric sat in `:learning` forever.
+
 ### Pre-release review history
 
 The detector math and runtime went through three review/fix passes

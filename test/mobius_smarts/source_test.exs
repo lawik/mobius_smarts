@@ -76,4 +76,94 @@ defmodule MobiusSmarts.SourceTest do
       assert_raise KeyError, fn -> Source.from_summary_windows(windows) end
     end
   end
+
+  describe "resample_windows/2" do
+    # Helper: the summary window Mobius would compute from these raw reports.
+    defp window_of(timestamp, values) do
+      n = length(values)
+      sum = Enum.sum(values)
+      sum_sqrd = values |> Enum.map(&(&1 * &1)) |> Enum.sum()
+      avg = sum / n
+
+      std =
+        if n == 1,
+          do: 0.0,
+          else: :math.sqrt(max(0.0, (sum_sqrd - sum * sum / n) / (n - 1)))
+
+      %{timestamp: timestamp, average: avg, std_dev: std, reports: n}
+    end
+
+    test "merging windows reproduces the statistics of the pooled raw reports" do
+      a = [1.0, 2.0, 3.0]
+      b = [5.0, 7.0]
+
+      [merged] =
+        Source.resample_windows(
+          [window_of(110, a), window_of(120, b)],
+          {1, :minute}
+        )
+
+      expected = window_of(120, a ++ b)
+
+      assert merged.timestamp == 120
+      assert merged.reports == 5
+      assert_in_delta merged.average, expected.average, 1.0e-9
+      assert_in_delta merged.std_dev, expected.std_dev, 1.0e-9
+    end
+
+    test ":auto merges mixed-tier windows into buckets of the coarsest tier" do
+      # The Mobius.Data.summary_windows/3 shape for a query spanning more
+      # than the RRD seconds archive: minute-cadence windows trailing into
+      # second-cadence ones for the freshest stretch.
+      minute_windows =
+        for i <- 1..5, do: window_of(600 + i * 60, [10.0 + i, 12.0 + i])
+
+      second_windows =
+        for i <- 1..10, do: window_of(900 + i, [20.0])
+
+      resampled = Source.resample_windows(minute_windows ++ second_windows, :auto)
+
+      assert Enum.map(resampled, & &1.timestamp) == [660, 720, 780, 840, 900, 910]
+      # The minute windows pass through untouched...
+      assert Enum.take(resampled, 5) == minute_windows
+      # ...and the second-cadence tail merges into one trailing bucket.
+      assert List.last(resampled) == window_of(910, List.duplicate(20.0, 10))
+    end
+
+    test ":auto ignores an isolated outage step when picking the cadence" do
+      windows =
+        for ts <- [60, 120, 180, 7380, 7440, 7500], do: window_of(ts, [1.0, 2.0])
+
+      # Steps snap to [60, 60, 3600, 60, 60]: the 2-hour outage never
+      # repeats back-to-back, so the cadence stays one minute and the
+      # windows pass through unchanged.
+      assert Source.resample_windows(windows, :auto) == windows
+    end
+
+    test ":auto passes through short or no-agreeing-cadence series" do
+      short = [window_of(1, [1.0]), window_of(2, [2.0])]
+      assert Source.resample_windows(short, :auto) == short
+
+      no_pair = [window_of(60, [1.0]), window_of(120, [2.0]), window_of(3720, [3.0])]
+      assert Source.resample_windows(no_pair, :auto) == no_pair
+    end
+
+    test "windows on a bucket boundary close that bucket, not the next" do
+      windows = [window_of(120, [1.0]), window_of(121, [2.0])]
+
+      assert [%{timestamp: 120}, %{timestamp: 121}] =
+               Source.resample_windows(windows, {1, :minute})
+    end
+
+    test ":native and second-resolution are identity; sub-second raises" do
+      windows = [window_of(1, [1.0]), window_of(2, [2.0]), window_of(3, [3.0])]
+
+      assert Source.resample_windows(windows, :native) == windows
+      assert Source.resample_windows(windows, {1, :second}) == windows
+
+      assert_raise ArgumentError, ~r/at least \{1, :second\}/, fn ->
+        Source.resample_windows(windows, 500)
+      end
+    end
+  end
 end

@@ -16,6 +16,8 @@ defmodule MobiusSmarts.Source do
   already-fetched data.
   """
 
+  alias MobiusSmarts.Config
+
   @type series() :: %{timestamps: Nx.Tensor.t(), values: Nx.Tensor.t()}
   @type summary_series() :: %{
           timestamps: Nx.Tensor.t(),
@@ -23,6 +25,26 @@ defmodule MobiusSmarts.Source do
           std_dev: Nx.Tensor.t(),
           reports: Nx.Tensor.t()
         }
+
+  @typedoc "One summary window, the `Mobius.Data.summary_windows/3` shape."
+  @type window() :: %{
+          timestamp: integer(),
+          average: number(),
+          std_dev: number(),
+          reports: non_neg_integer()
+        }
+
+  @typedoc """
+  Target cadence for `resample_windows/2`: `:auto` (coarsest native
+  RRD cadence present), `:native` (Mobius's mixed-cadence windows,
+  untouched), or an explicit `t:MobiusSmarts.Config.duration/0`.
+  """
+  @type resolution() :: :auto | :native | Config.duration()
+
+  # Mobius.RRD archives snapshots at second/minute/hour/day cadence
+  # simultaneously; a window-to-window step is snapped down to the
+  # archive tier it can only have come from.
+  @tiers_desc [86_400, 3_600, 60, 1]
 
   @doc """
   Pull a numeric metric series from Mobius.
@@ -59,6 +81,29 @@ defmodule MobiusSmarts.Source do
   missing timestamps, which is itself a health signal worth checking
   before running detectors.
 
+  ## Window resolution
+
+  Mobius's RRD stores snapshots at four cadences at once (seconds,
+  minutes, hours, days — see `Mobius.RRD`), and
+  `Mobius.Data.summary_windows/3` deltas consecutive snapshots across
+  *all* of them: any query spanning more than the seconds archive
+  comes back with second-cadence windows for the freshest couple of
+  minutes, minute-cadence behind that, and so on. The detectors assume
+  comparable windows — mixed cadences read as reporting gaps and
+  incomparable subgroups — so this function resamples to one cadence:
+
+  - `resolution: :auto` (default) — buckets of the coarsest native
+    cadence present in the result; a 2-hour query yields minute
+    windows throughout.
+  - `resolution: duration` — an explicit `{1, :minute}`-style bucket
+    width (or raw milliseconds). Narrower than the coarsest native
+    cadence in range reintroduces the gaps `:auto` exists to remove.
+  - `resolution: :native` — Mobius's mixed-cadence windows, untouched.
+
+  Resampling merges sum/sum-of-squares/count deltas, so a merged
+  bucket carries exactly the statistics Mobius would have computed
+  between the bucket's endpoint snapshots (see `resample_windows/2`).
+
   A caveat on `std_dev`: Mobius currently computes it with a naive
   sum-of-squares accumulator, which cancels catastrophically when the
   values are large floats relative to their spread — memory in bytes is
@@ -71,8 +116,10 @@ defmodule MobiusSmarts.Source do
   """
   @spec summary_series(Mobius.metric_name(), map(), keyword()) :: summary_series() | :empty
   def summary_series(metric_name, tags \\ %{}, opts \\ []) do
+    {resolution, opts} = Keyword.pop(opts, :resolution, :auto)
+
     case Mobius.Data.summary_windows(metric_name, tags, opts) do
-      {:ok, windows} -> from_summary_windows(windows)
+      {:ok, windows} -> windows |> resample_windows(resolution) |> from_summary_windows()
       {:error, :unavailable} -> :empty
     end
   end
@@ -167,5 +214,106 @@ defmodule MobiusSmarts.Source do
       std_dev: Nx.tensor(Enum.map(windows, &(&1.std_dev * 1.0)), type: :f64),
       reports: Nx.tensor(Enum.map(windows, &Map.fetch!(&1, :reports)), type: :s64)
     }
+  end
+
+  @doc """
+  Resample summary windows to a uniform cadence (see the resolution
+  section on `summary_series/3`).
+
+  Windows are grouped into end-aligned buckets of the target width and
+  merged exactly: each window's `average`/`std_dev`/`reports` is
+  unwound back to the sum, sum-of-squares, and count deltas it came
+  from, those are added, and the bucket's statistics recomputed — the
+  same numbers Mobius would report between the bucket's endpoint
+  snapshots. A merged bucket keeps the timestamp of its latest member
+  (its end, for complete buckets), so a trailing partial bucket never
+  claims a timestamp from the future.
+
+  `:auto` measures the coarsest native RRD cadence present: each
+  window-to-window step is snapped down to the archive tier it can
+  only have come from (second/minute/hour/day), and a tier counts only
+  when two *consecutive* steps agree on it — an isolated long step is
+  an outage, not a cadence. With fewer than 3 windows (or no agreeing
+  pair) the windows pass through unchanged.
+
+  ## Examples
+
+      iex> windows = [
+      ...>   %{timestamp: 100, average: 10.0, std_dev: 0.0, reports: 1},
+      ...>   %{timestamp: 120, average: 14.0, std_dev: 0.0, reports: 1}
+      ...> ]
+      iex> [merged] = MobiusSmarts.Source.resample_windows(windows, {1, :minute})
+      iex> {merged.timestamp, merged.average, merged.reports}
+      {120, 12.0, 2}
+  """
+  @spec resample_windows([window()], resolution()) :: [window()]
+  def resample_windows(windows, :native), do: windows
+
+  def resample_windows(windows, :auto) do
+    case native_cadence(windows) do
+      nil -> windows
+      width -> resample_windows(windows, {width, :second})
+    end
+  end
+
+  def resample_windows(windows, resolution) do
+    case Config.seconds(resolution) do
+      0 ->
+        raise ArgumentError,
+              "resolution must be at least {1, :second}, got: #{inspect(resolution)} " <>
+                "(raw integers are milliseconds)"
+
+      1 ->
+        windows
+
+      width ->
+        windows
+        |> Enum.group_by(fn window -> div(window.timestamp + width - 1, width) * width end)
+        |> Enum.sort_by(&elem(&1, 0))
+        |> Enum.map(fn {_bucket_end, members} -> merge_windows(members) end)
+    end
+  end
+
+  defp native_cadence(windows) when length(windows) < 3, do: nil
+
+  defp native_cadence(windows) do
+    windows
+    |> Enum.map(& &1.timestamp)
+    |> Enum.chunk_every(2, 1, :discard)
+    |> Enum.map(fn [a, b] -> snap_tier(b - a) end)
+    |> Enum.chunk_every(2, 1, :discard)
+    |> Enum.filter(fn [a, b] -> a == b end)
+    |> Enum.map(&hd/1)
+    |> Enum.max(fn -> nil end)
+  end
+
+  defp snap_tier(diff), do: Enum.find(@tiers_desc, 1, &(&1 <= diff))
+
+  defp merge_windows([window]), do: window
+
+  defp merge_windows(members) do
+    reports = members |> Enum.map(& &1.reports) |> Enum.sum()
+    sum = members |> Enum.map(&(&1.average * &1.reports)) |> Enum.sum()
+
+    sum_sqrd =
+      members
+      |> Enum.map(fn w ->
+        partial = w.average * w.reports
+        w.std_dev * w.std_dev * (w.reports - 1) + partial * partial / w.reports
+      end)
+      |> Enum.sum()
+
+    %{
+      timestamp: members |> Enum.map(& &1.timestamp) |> Enum.max(),
+      average: sum / reports,
+      std_dev: merged_std_dev(sum, sum_sqrd, reports),
+      reports: reports
+    }
+  end
+
+  defp merged_std_dev(_sum, _sum_sqrd, 1), do: 0.0
+
+  defp merged_std_dev(sum, sum_sqrd, n) do
+    :math.sqrt(max(0.0, (sum_sqrd - sum * sum / n) / (n - 1)))
   end
 end
