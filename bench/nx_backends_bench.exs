@@ -9,6 +9,7 @@
 #     BENCH_N=4096                series length (default 1024)
 #     BENCH_TIME=2                seconds of measurement per scenario
 #     BENCH_NX_EIGEN_PATH=...     use a local nx_eigen checkout instead of Hex
+#     BENCH_NX_EIGEN_GITHUB=owner/repo#branch   ...or a GitHub branch
 #
 # What runs: every detector path that is actually Nx — Jump's chart kernel,
 # Drift's cumulative-op CUSUM, Shift's band kernel, Changepoint's prefix-sum
@@ -29,9 +30,18 @@ skip =
 repo = Path.expand("..", __DIR__)
 
 nx_eigen_dep =
-  case System.get_env("BENCH_NX_EIGEN_PATH") do
-    nil -> {:nx_eigen, "~> 0.1"}
-    path -> {:nx_eigen, path: Path.expand(path)}
+  case {System.get_env("BENCH_NX_EIGEN_PATH"), System.get_env("BENCH_NX_EIGEN_GITHUB")} do
+    {nil, nil} ->
+      {:nx_eigen, "~> 0.1"}
+
+    {path, _} when is_binary(path) ->
+      {:nx_eigen, path: Path.expand(path)}
+
+    {nil, github} ->
+      case String.split(github, "#", parts: 2) do
+        [repo, branch] -> {:nx_eigen, github: repo, branch: branch}
+        [repo] -> {:nx_eigen, github: repo}
+      end
   end
 
 optional = [
