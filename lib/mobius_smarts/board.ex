@@ -383,24 +383,21 @@ defmodule MobiusSmarts.Board do
 
         detection = detection_state(progress)
 
-        learning =
-          if detection == :unstable do
-            # An ETA would be a lie: the clock keeps resetting.
-            Map.put(progress, :eta_s, nil)
-          else
-            with_eta(progress, state.config)
-          end
-
         %{
           metric: metric.name,
           tags: metric.tags,
           detection: detection,
           detectors: armed_detectors(metric, nil),
-          learning: learning
+          learning: learning_entry(detection, progress, state.config)
         }
       end
     end
   end
+
+  # An :unstable metric gets no ETA — that clock keeps resetting, so
+  # an estimate would be a lie.
+  defp learning_entry(:unstable, progress, _config), do: Map.put(progress, :eta_s, nil)
+  defp learning_entry(_detection, progress, config), do: with_eta(progress, config)
 
   # No amount of waiting fits a baseline on data with nothing to model.
   defp detection_state(%{reason: reason}) when reason in [:no_dispersion, :zero_variance],
