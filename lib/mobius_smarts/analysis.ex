@@ -144,8 +144,21 @@ defmodule MobiusSmarts.Analysis do
     if length(lists.avg) < min_windows do
       {:error, progress(:insufficient, length(lists.avg), min_windows)}
     else
-      fit_settled(settled_segment(lists), min_windows, now)
+      segment = settled_segment(lists)
+      fit_settled(segment, sliced_from_trending?(lists, segment), min_windows, now)
     end
+  end
+
+  # When the changepoint slice removed part of a stretch that trends
+  # as a whole, the surviving tail inherits suspicion: a steep ramp
+  # diced into steps leaves a weakly-trending tail that passes the
+  # standard gates on its own (issue #14). A genuine old step also
+  # trips this — monotone steps are Mann-Kendall-significant — but its
+  # flat tail then passes the tightened halves test, so only
+  # still-moving tails are refused.
+  defp sliced_from_trending?(lists, segment) do
+    length(segment.avg) < length(lists.avg) and
+      Trend.mann_kendall(lists.avg, alpha: @trend_gate_alpha).trend != :none
   end
 
   # Stricter than detection's default 0.05: a false :trending only
@@ -153,8 +166,17 @@ defmodule MobiusSmarts.Analysis do
   # metric on a spurious trend call would hold up detection entirely.
   @trend_gate_alpha 0.01
 
-  defp fit_settled(segment, min_windows, now) do
+  # A halves difference this many standard errors apart means the
+  # "settled" segment still carries a level move. ~0.3% false trips on
+  # truly flat data — a tick of extra learning, retried immediately.
+  # Suspicious tails (sliced out of a globally-trending stretch) are
+  # held to the tighter bar.
+  @halves_t_limit 3.0
+  @suspicious_halves_t_limit 2.0
+
+  defp fit_settled(segment, suspicious?, min_windows, now) do
     settled = length(segment.avg)
+    halves_limit = if suspicious?, do: @suspicious_halves_t_limit, else: @halves_t_limit
 
     cond do
       settled < min_windows ->
@@ -163,12 +185,40 @@ defmodule MobiusSmarts.Analysis do
       Trend.mann_kendall(segment.avg, alpha: @trend_gate_alpha).trend != :none ->
         {:error, progress(:trending, settled, min_windows)}
 
+      # The changepoint slice can dice a long steep ramp into steps
+      # whose tail falls under Mann-Kendall significance (issue #14);
+      # the residual rise still shows as the segment's halves
+      # disagreeing. A flat tail after an old, genuine step passes —
+      # this only refuses stretches that are still moving.
+      not halves_stable?(segment.avg, halves_limit) ->
+        {:error, progress(:trending, settled, min_windows)}
+
       true ->
         case do_fit(segment, now) do
           {:ok, baseline} -> {:ok, baseline}
           {:error, reason} -> {:error, progress(reason, settled, min_windows)}
         end
     end
+  end
+
+  defp halves_stable?(avgs, t_limit) do
+    {first, second} = Enum.split(avgs, div(length(avgs), 2))
+    {m1, v1, n1} = mean_var(first)
+    {m2, v2, n2} = mean_var(second)
+    standard_error = :math.sqrt(v1 / n1 + v2 / n2)
+
+    if standard_error < 1.0e-12 do
+      abs(m1 - m2) < 1.0e-9
+    else
+      abs(m1 - m2) / standard_error <= t_limit
+    end
+  end
+
+  defp mean_var(values) do
+    n = length(values)
+    mean = Enum.sum(values) / n
+    var = Enum.reduce(values, 0.0, fn v, acc -> acc + (v - mean) * (v - mean) end) / max(n - 1, 1)
+    {mean, var, n}
   end
 
   defp progress(reason, windows, needed) do

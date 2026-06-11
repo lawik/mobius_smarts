@@ -131,21 +131,31 @@ defmodule MobiusSmarts.AnalysisTest do
       assert baseline.target == 42.0
     end
 
-    test "CURRENT BEHAVIOR #14: changepoint slicing launders a steep ramp into a fit" do
+    test "an undetectably-trending tail fits; its continuation is caught as honest drift (#14)" do
       seeded(16)
-      # Steep enough that the changepoint check dices the ramp into
-      # steps; the settled tail then falls under Mann-Kendall
-      # significance and the fit freezes a target partway up a series
-      # that is still rising. Bounded by the fit-horizon rule (#2) —
-      # the continuing rise is detected from fresh data — but the
-      # target is mid-ramp at birth.
+      # The changepoint slice dices this ramp into steps whose tail is
+      # statistically indistinguishable from flat (measured: halves
+      # t = 1.19, Mann-Kendall p = 0.17 over 60 windows) — refusing it
+      # would refuse genuinely flat data too, so the fit goes through.
+      # Steeper residual tails ARE refused: sliced-from-trending
+      # stretches get the tightened halves bar.
       values = Enum.map(0..179, fn w -> 50.0 + 0.003 * w + noise(0.25) end)
       lists = windows(values)
 
-      # The full stretch is unambiguously trending...
       assert MobiusSmarts.Detect.Trend.mann_kendall(values, alpha: 0.01).trend == :increasing
-      # ...yet the fit goes through: the gate only saw the diced tail.
-      assert {:ok, _baseline} = Analysis.fit_baseline(lists, min_windows: 60, now: 0)
+      assert {:ok, baseline} = Analysis.fit_baseline(lists, min_windows: 60, now: 0)
+
+      # The safety net is the post-fit division of labor: the ramp
+      # keeps going and the drift detector catches it from fresh
+      # windows only (the fit-horizon rule, #2) — a dated, honest
+      # finding rather than a phantom about the past.
+      continuation = Enum.map(180..299, fn w -> 50.0 + 0.003 * w + noise(0.25) end)
+      fresh = windows(continuation, start: 1_700_000_000 + 180 * 60)
+
+      candidates = Analysis.tick_candidates(fresh, baseline, calib(), config())
+
+      assert drifting = Enum.find(candidates, &(&1.kind == :drifting_up))
+      assert drifting.onset > baseline.to
     end
 
     test "a smooth ramp is refused with :trending — never a mid-ramp target (#3)" do
