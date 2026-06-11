@@ -537,22 +537,46 @@ defmodule MobiusSmarts.Analysis do
 
   Concern is a flat 1.0 — with zero learned variance there is no
   scale to price the departure against.
-  """
-  @spec departure_candidates(lists(), map()) :: [candidate()]
-  def departure_candidates(%{avg: []}, _baseline), do: []
 
-  def departure_candidates(lists, baseline) do
+  A departure that *settles*: once the trailing `min_windows` all
+  agree on a new value, the step is the new normal — a
+  `:baseline_stale` observation triggers relearning instead of holding
+  the condition forever (issue #15).
+  """
+  @spec departure_candidates(lists(), map(), pos_integer()) :: [candidate()]
+  def departure_candidates(%{avg: []}, _baseline, _min_windows), do: []
+
+  def departure_candidates(lists, baseline, min_windows) do
     target = baseline.target
     tolerance = max(abs(target) * 1.0e-9, 1.0e-9)
 
     flags =
       Enum.map(lists.avg, fn avg -> if abs(avg - target) > tolerance, do: 1, else: 0 end)
 
-    case persistent_violation(flags) do
-      nil ->
-        []
+    cond do
+      # The metric has been stable at a NEW value for the same evidence
+      # bar as initial learning: that is the new normal, not a
+      # condition (issue #15). The stale-baseline observation makes the
+      # runtime drop the old constant and relearn; the active
+      # :departed finding then clears through ordinary misses.
+      settled_elsewhere?(lists.avg, target, tolerance, min_windows) ->
+        [
+          %{
+            kind: :baseline_stale,
+            detector: :departure,
+            class: :observation,
+            severity: :info,
+            concern: 0.0,
+            onset: List.last(lists.ts),
+            evidence: %{constant: target, settled_at: List.last(lists.avg)},
+            message:
+              "stable at #{round2(List.last(lists.avg))} for #{min_windows} windows — " <>
+                "accepting it as the new constant (was #{round2(target)})"
+          }
+        ]
 
-      {first_i, last_i} ->
+      violation = persistent_violation(flags) ->
+        {first_i, last_i} = violation
         value = Enum.at(lists.avg, last_i)
         onset = Enum.at(lists.ts, first_i)
 
@@ -569,7 +593,21 @@ defmodule MobiusSmarts.Analysis do
               "left its constant #{round2(target)} (now #{round2(value)}) at #{fmt_ts(onset)}"
           }
         ]
+
+      true ->
+        []
     end
+  end
+
+  # The trailing min_windows all agree with each other and disagree
+  # with the learned constant.
+  defp settled_elsewhere?(avgs, target, tolerance, min_windows) do
+    trailing = Enum.take(avgs, -min_windows)
+    [head | _rest] = trailing
+
+    length(trailing) >= min_windows and
+      abs(head - target) > tolerance and
+      Enum.all?(trailing, &(abs(&1 - head) <= tolerance))
   end
 
   ## Missingness candidates

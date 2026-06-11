@@ -187,7 +187,7 @@ defmodule MobiusSmarts.Watcher do
         fresh = Analysis.since(segment, baseline.to)
 
         if baseline[:degenerate] do
-          Analysis.departure_candidates(fresh, baseline)
+          Analysis.departure_candidates(fresh, baseline, state.config.min_baseline_windows)
         else
           Analysis.tick_candidates(fresh, baseline, state.calib, state.config)
         end

@@ -410,14 +410,24 @@ defmodule MobiusSmarts.AnalysisTest do
       baseline = %{target: 100.0, degenerate: true}
 
       blip = windows(List.duplicate(100.0, 39) ++ [113.0], std: 0.0)
-      assert Analysis.departure_candidates(blip, baseline) == []
+      assert Analysis.departure_candidates(blip, baseline, 60) == []
 
       stepped = windows(List.duplicate(100.0, 37) ++ List.duplicate(113.0, 3), std: 0.0)
-      assert [departed] = Analysis.departure_candidates(stepped, baseline)
+      assert [departed] = Analysis.departure_candidates(stepped, baseline, 60)
       assert departed.kind == :departed
       assert departed.class == :condition
       assert departed.onset == Enum.at(stepped.ts, 37)
       assert departed.message =~ "left its constant"
+    end
+
+    test "a departure that settles for min_windows becomes the new normal (#15)" do
+      baseline = %{target: 100.0, degenerate: true}
+      settled = windows(List.duplicate(100.0, 10) ++ List.duplicate(113.0, 60), std: 0.0)
+
+      assert [stale] = Analysis.departure_candidates(settled, baseline, 60)
+      assert stale.kind == :baseline_stale
+      assert stale.class == :observation
+      assert stale.message =~ "accepting it as the new constant"
     end
   end
 

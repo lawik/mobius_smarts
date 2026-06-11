@@ -128,7 +128,10 @@ defmodule MobiusSmarts.HarnessTest do
           seed: 4,
           segments: [
             %{minutes: 90, level: 100.0, distribution: :constant},
-            %{minutes: 70, level: 113.0, distribution: :constant}
+            # Short of the relearn bar (min_baseline_windows), so the
+            # departure stays an active condition here; the durable-step
+            # relearn path is the #15 scenario below.
+            %{minutes: 30, level: 113.0, distribution: :constant}
           ]
         )
 
@@ -171,12 +174,12 @@ defmodule MobiusSmarts.HarnessTest do
     end
   end
 
-  describe "durable constant steps (#15)" do
-    test "CURRENT BEHAVIOR #15: a permanent new constant keeps :departed active forever" do
-      # The step is real and worth one alarm — but four hours later the
-      # metric has been perfectly stable at its new value and the
-      # finding is still being re-confirmed against the old constant.
-      # Nothing ever accepts the new normal.
+  describe "durable constant steps (fixed: #15)" do
+    test "a permanent new constant is alarmed once, then relearned as the new normal" do
+      # The step is real and worth one alarm — and once the metric has
+      # been stable at its new value for min_baseline_windows (the same
+      # evidence bar as initial learning), the constant is relearned
+      # and the finding clears.
       windows =
         Synthetic.series(
           seed: 7,
@@ -188,12 +191,15 @@ defmodule MobiusSmarts.HarnessTest do
 
       result = Replay.run(windows, config: [false_alarm_every: {1, :week}])
 
-      # Raised exactly once (re-confirmations update in place)...
-      assert [_one] = Enum.filter(result.raised, &(&1.kind == :departed))
-      # ...but still active after 4h of stability at the new constant,
-      # against a baseline that still says 100.
-      assert [%{kind: :departed, status: :active}] = result.findings
-      assert result.baseline.target == 100.0
+      # Raised exactly once...
+      assert [departed] = Enum.filter(result.raised, &(&1.kind == :departed))
+      # ...cleared once the new constant was accepted...
+      assert Enum.any?(result.cleared, &(&1.kind == :departed))
+      assert result.findings == []
+      # ...and the baseline now describes the new normal.
+      assert result.baseline.degenerate
+      assert result.baseline.target == 113.0
+      assert departed.message =~ "left its constant"
     end
   end
 
