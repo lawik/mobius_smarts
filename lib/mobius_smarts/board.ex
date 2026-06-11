@@ -43,7 +43,17 @@ defmodule MobiusSmarts.Board do
 
   @spec put_baseline(atom(), scope(), map()) :: :ok
   def put_baseline(board, key, baseline) do
-    GenServer.call(board, {:put, {:baseline, key}, baseline})
+    GenServer.call(board, {:put_baseline, key, baseline})
+  end
+
+  @doc """
+  Record where baselining stands for a still-learning metric
+  (`%{reason: ..., windows: ..., needed: ...}`, the
+  `MobiusSmarts.Analysis.fit_baseline/2` error shape).
+  """
+  @spec put_learning(atom(), scope(), map()) :: :ok
+  def put_learning(board, key, progress) do
+    GenServer.call(board, {:put, {:learning, key}, progress})
   end
 
   @spec put_novelty(atom(), map()) :: :ok
@@ -118,6 +128,14 @@ defmodule MobiusSmarts.Board do
 
   def handle_call({:put, key, value}, _from, state) do
     :ets.insert(state.table, {key, value})
+    refresh_status(state)
+    {:reply, :ok, state}
+  end
+
+  # A fitted baseline supersedes the metric's learning progress.
+  def handle_call({:put_baseline, key, baseline}, _from, state) do
+    :ets.insert(state.table, {{:baseline, key}, baseline})
+    :ets.delete(state.table, {:learning, key})
     refresh_status(state)
     {:reply, :ok, state}
   end
@@ -224,7 +242,8 @@ defmodule MobiusSmarts.Board do
       since: since,
       concern: active |> Enum.map(& &1.concern) |> Enum.max(fn -> 0.0 end),
       findings: active,
-      learning: learning(state),
+      metrics: metric_states(state),
+      novelty: novelty_state(state),
       updated_at: now
     }
 
@@ -260,11 +279,68 @@ defmodule MobiusSmarts.Board do
     end
   end
 
-  defp learning(state) do
-    for metric <- state.config.watch,
-        key = Config.Metric.key(metric),
-        :ets.lookup(state.table, {:baseline, key}) == [] do
-      metric.name
+  # Per-metric detection posture: which detector streams are armed
+  # right now, and — while the baseline-gated ones aren't — where
+  # baselining stands. Missingness (:silent / :reporting_gap) is
+  # always on and carries no detector tag, so it isn't listed.
+  defp metric_states(state) do
+    for metric <- state.config.watch do
+      key = Config.Metric.key(metric)
+      baseline? = :ets.lookup(state.table, {:baseline, key}) != []
+
+      if baseline? do
+        %{
+          metric: metric.name,
+          tags: metric.tags,
+          detection: :active,
+          detectors: armed_detectors(metric, true),
+          learning: nil
+        }
+      else
+        progress =
+          lookup(state.table, {:learning, key}) ||
+            %{reason: :no_data, windows: 0, needed: state.config.min_baseline_windows}
+
+        %{
+          metric: metric.name,
+          tags: metric.tags,
+          detection: detection_state(progress.reason),
+          detectors: armed_detectors(metric, false),
+          learning: with_eta(progress, state.config)
+        }
+      end
+    end
+  end
+
+  # No amount of waiting fits a baseline on data with nothing to model.
+  defp detection_state(reason) when reason in [:no_dispersion, :zero_variance], do: :blocked
+  defp detection_state(_reason), do: :learning
+
+  defp with_eta(%{reason: reason} = progress, config)
+       when reason in [:insufficient, :unsettled] do
+    remaining = max(progress.needed - progress.windows, 0)
+    Map.put(progress, :eta_s, remaining * Config.seconds(config.resolution))
+  end
+
+  defp with_eta(progress, _config), do: Map.put(progress, :eta_s, nil)
+
+  defp armed_detectors(metric, baseline?) do
+    baseline_gated =
+      if baseline? do
+        [:jump, :shift, :drift] ++ if metric.histogram, do: [:shape], else: []
+      else
+        []
+      end
+
+    trend = if metric.ceiling || metric.floor, do: [:trend], else: []
+    baseline_gated ++ trend ++ [:changepoint]
+  end
+
+  defp novelty_state(state) do
+    cond do
+      not Config.novelty?(state.config) -> :off
+      lookup(state.table, :novelty) != nil -> :active
+      true -> :learning
     end
   end
 

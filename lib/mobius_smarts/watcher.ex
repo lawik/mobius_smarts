@@ -101,6 +101,12 @@ defmodule MobiusSmarts.Watcher do
 
     case series do
       :empty ->
+        Board.put_learning(state.board, key, %{
+          reason: :no_data,
+          windows: 0,
+          needed: config.min_baseline_windows
+        })
+
         Board.report(state.board, key, @tick_kinds, [Analysis.silent_candidate(nil, now)])
         {nil, state}
 
@@ -179,7 +185,8 @@ defmodule MobiusSmarts.Watcher do
         Board.put_baseline(state.board, key, baseline)
         baseline
 
-      {:error, _learning} ->
+      {:error, progress} ->
+        Board.put_learning(state.board, key, progress)
         nil
     end
   end

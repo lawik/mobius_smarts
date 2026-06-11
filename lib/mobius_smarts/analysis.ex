@@ -92,26 +92,44 @@ defmodule MobiusSmarts.Analysis do
      and drop out-of-control windows from the pool, then refit.
 
   Returns `{:ok, baseline}` with `target`/`sigma_reports`/`sigma_avg`
-  plus fit metadata, or `{:error, :insufficient | :unsettled |
-  :zero_variance | :no_dispersion}` while the metric must keep
-  learning.
+  plus fit metadata, or `{:error, progress}` while the metric must
+  keep learning — `progress` is `%{reason: ..., windows: ...,
+  needed: ...}` so the caller can show where baselining stands:
+
+  - `:insufficient` — fewer than `needed` windows since the last gap;
+    `windows` is how many exist, so the remainder is a real ETA.
+  - `:unsettled` — a recent regime change; `windows` counts the
+    homogeneous stretch since it, which must reach `needed`.
+  - `:no_dispersion` / `:zero_variance` — the data carries nothing to
+    model (all singleton windows / a constant series); waiting longer
+    changes nothing unless the metric's behavior does.
   """
-  @spec fit_baseline(lists(), keyword()) :: {:ok, map()} | {:error, atom()}
+  @spec fit_baseline(lists(), keyword()) ::
+          {:ok, map()}
+          | {:error, %{reason: atom(), windows: non_neg_integer(), needed: pos_integer()}}
   def fit_baseline(lists, opts) do
     min_windows = Keyword.fetch!(opts, :min_windows)
     now = Keyword.fetch!(opts, :now)
 
     if length(lists.avg) < min_windows do
-      {:error, :insufficient}
+      {:error, progress(:insufficient, length(lists.avg), min_windows)}
     else
       segment = settled_segment(lists)
+      settled = length(segment.avg)
 
-      if length(segment.avg) < min_windows do
-        {:error, :unsettled}
+      if settled < min_windows do
+        {:error, progress(:unsettled, settled, min_windows)}
       else
-        do_fit(segment, now)
+        case do_fit(segment, now) do
+          {:ok, baseline} -> {:ok, baseline}
+          {:error, reason} -> {:error, progress(reason, settled, min_windows)}
+        end
       end
     end
+  end
+
+  defp progress(reason, windows, needed) do
+    %{reason: reason, windows: windows, needed: needed}
   end
 
   defp settled_segment(lists) do

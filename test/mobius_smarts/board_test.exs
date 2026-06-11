@@ -182,11 +182,30 @@ defmodule MobiusSmarts.BoardTest do
     assert %{level: :degraded} = Board.status(name)
   end
 
-  test "learning lists watched metrics without baselines", %{name: name} do
-    assert %{learning: ["m"]} = Board.status(name)
+  test "metrics report detection posture, learning progress, and armed detectors",
+       %{name: name} do
+    # No baseline and no recorded progress yet: no data seen, nothing
+    # armed beyond the always-on changepoint sweep. One watched metric
+    # keeps novelty off (:auto needs 3).
+    assert %{metrics: [entry], novelty: :off} = Board.status(name)
+    assert %{metric: "m", detection: :learning, detectors: [:changepoint]} = entry
+    assert %{reason: :no_data, windows: 0, eta_s: nil} = entry.learning
 
+    # Progress recorded by a tick: the windows still needed become an
+    # ETA at one window per :resolution.
+    Board.put_learning(name, {"m", %{}}, %{reason: :insufficient, windows: 45, needed: 60})
+    assert %{metrics: [%{detection: :learning, learning: progress}]} = Board.status(name)
+    assert progress.eta_s == 15 * 60
+
+    # Data with nothing to model is blocked, not eternally learning.
+    Board.put_learning(name, {"m", %{}}, %{reason: :no_dispersion, windows: 80, needed: 60})
+    assert %{metrics: [%{detection: :blocked, learning: %{eta_s: nil}}]} = Board.status(name)
+
+    # A fitted baseline arms the gated detectors and clears the progress.
     Board.put_baseline(name, {"m", %{}}, %{target: 1.0, sigma_avg: 0.1, fitted_at: 0})
-    assert %{learning: []} = Board.status(name)
+    assert %{metrics: [armed]} = Board.status(name)
+    assert %{detection: :active, learning: nil} = armed
+    assert armed.detectors == [:jump, :shift, :drift, :changepoint]
     assert %{target: 1.0} = Board.baseline(name, {"m", %{}})
   end
 

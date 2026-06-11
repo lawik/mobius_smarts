@@ -80,7 +80,25 @@ defmodule MobiusSmarts do
       MobiusSmarts.status()
       #=> %{level: :watch, since: 1759300000, concern: 1.2,
       #     findings: [%MobiusSmarts.Finding{kind: :drifting_up, ...}],
-      #     learning: [], updated_at: ...}
+      #     metrics: [
+      #       %{metric: "vm.memory.used_percent", tags: %{}, detection: :active,
+      #         detectors: [:jump, :shift, :drift, :shape, :changepoint],
+      #         learning: nil},
+      #       %{metric: "disk.used_percent", tags: %{}, detection: :learning,
+      #         detectors: [:trend, :changepoint],
+      #         learning: %{reason: :insufficient, windows: 37, needed: 60,
+      #                     eta_s: 1380}}
+      #     ],
+      #     novelty: :learning, updated_at: ...}
+
+  Each `metrics` entry says which detector streams are armed for that
+  metric right now and, while the baseline-gated ones aren't, where
+  baselining stands: `:learning` with a windows count and ETA,
+  `:unsettled` when a recent regime change keeps resetting the clock,
+  or `:blocked` when the data carries nothing to model (an all-zero
+  series stays blocked until its behavior changes — no amount of
+  waiting helps). `novelty` is the cross-metric model's own state:
+  `:off`, `:learning`, or `:active`.
 
       MobiusSmarts.findings()      # active conditions, worst first
       MobiusSmarts.observations()  # recent annotations (spikes, gaps, regime changes)
@@ -175,7 +193,9 @@ defmodule MobiusSmarts do
   @doc """
   The instance's aggregate health: `%{level: :ok | :watch | :degraded
   | :critical, since: unix_seconds, concern: float, findings: [...],
-  learning: [metric names still baselining], updated_at: ...}`.
+  metrics: [per-metric detection posture], novelty: :off | :learning
+  | :active, updated_at: ...}` — the moduledoc shows the `metrics`
+  entry shape.
 
   Like every read (`status/1`, `findings/1`, `observations/3`,
   `baseline/3`), raises `ArgumentError` when no instance with that

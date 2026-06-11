@@ -96,7 +96,7 @@ defmodule MobiusSmarts.AnalysisTest do
       lists = windows(values)
 
       # The settled segment after the changepoint is only 30 windows.
-      assert {:error, :unsettled} =
+      assert {:error, %{reason: :unsettled, windows: 30, needed: 60}} =
                Analysis.fit_baseline(lists, min_windows: 60, now: 1_700_010_000)
     end
 
@@ -118,12 +118,16 @@ defmodule MobiusSmarts.AnalysisTest do
 
     test "too little data" do
       lists = windows(List.duplicate(1.0, 10))
-      assert {:error, :insufficient} = Analysis.fit_baseline(lists, min_windows: 60, now: 0)
+
+      assert {:error, %{reason: :insufficient, windows: 10, needed: 60}} =
+               Analysis.fit_baseline(lists, min_windows: 60, now: 0)
     end
 
     test "a perfectly constant series has no variance to calibrate against" do
       lists = windows(List.duplicate(42.0, 100), std: 0.0)
-      assert {:error, :zero_variance} = Analysis.fit_baseline(lists, min_windows: 60, now: 0)
+
+      assert {:error, %{reason: :zero_variance, windows: 100, needed: 60}} =
+               Analysis.fit_baseline(lists, min_windows: 60, now: 0)
     end
 
     test "windows of single reports carry no dispersion: a learning state, not a crash" do
@@ -131,7 +135,8 @@ defmodule MobiusSmarts.AnalysisTest do
       values = Enum.map(1..100, fn _ -> 50.0 + noise(1.0) end)
       lists = windows(values, reports: 1, std: 0.0)
 
-      assert {:error, :no_dispersion} = Analysis.fit_baseline(lists, min_windows: 60, now: 0)
+      assert {:error, %{reason: :no_dispersion, windows: 100, needed: 60}} =
+               Analysis.fit_baseline(lists, min_windows: 60, now: 0)
     end
 
     test "the no-dispersion rescue does not swallow unrelated ArgumentErrors" do

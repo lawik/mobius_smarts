@@ -8,8 +8,8 @@ defmodule MobiusSmarts.Report do
 
   @spec render(map(), [Finding.t()]) :: String.t()
   def render(status, observations) do
-    ([header(status), learning(status.learning), findings(status.findings)] ++
-       recent(observations))
+    ([header(status)] ++
+       metrics(status.metrics) ++ findings(status.findings) ++ recent(observations))
     |> List.flatten()
     |> Enum.join("\n")
   end
@@ -18,11 +18,39 @@ defmodule MobiusSmarts.Report do
     level = status.level |> Atom.to_string() |> String.upcase()
 
     "MobiusSmarts — #{level} — concern #{round1(status.concern)} — " <>
-      "since #{fmt_ts(status.since)}"
+      "since #{fmt_ts(status.since)} — novelty #{status.novelty}"
   end
 
-  defp learning([]), do: []
-  defp learning(metrics), do: ["learning: #{Enum.join(metrics, ", ")}"]
+  defp metrics([]), do: []
+
+  defp metrics(metrics) do
+    name_width = metrics |> Enum.map(&String.length(&1.metric)) |> Enum.max()
+    cells = Enum.map(metrics, &{&1, state_cell(&1)})
+    cell_width = cells |> Enum.map(fn {_m, cell} -> String.length(cell) end) |> Enum.max()
+
+    rows =
+      for {entry, cell} <- cells do
+        "  #{String.pad_trailing(entry.metric, name_width)}  " <>
+          "#{String.pad_trailing(cell, cell_width)}  " <>
+          Enum.map_join(entry.detectors, " ", &Atom.to_string/1)
+      end
+
+    ["", "metrics:" | rows]
+  end
+
+  defp state_cell(%{detection: :active}), do: "active"
+
+  defp state_cell(%{learning: %{reason: :no_data}}), do: "no data yet"
+
+  defp state_cell(%{learning: %{reason: :no_dispersion}}),
+    do: "blocked: no within-window dispersion"
+
+  defp state_cell(%{learning: %{reason: :zero_variance}}), do: "blocked: zero variance"
+
+  defp state_cell(%{learning: %{reason: reason} = progress}) do
+    verb = if reason == :unsettled, do: "resettling", else: "learning"
+    "#{verb} #{progress.windows}/#{progress.needed} (~#{fmt_dur(progress.eta_s)})"
+  end
 
   defp findings([]), do: ["", "  no active findings"]
 
@@ -66,4 +94,9 @@ defmodule MobiusSmarts.Report do
   defp fmt_ts(unix) do
     unix |> DateTime.from_unix!() |> Calendar.strftime("%Y-%m-%d %H:%MZ")
   end
+
+  defp fmt_dur(s) when s < 90, do: "#{s}s"
+  defp fmt_dur(s) when s < 90 * 60, do: "#{round(s / 60)}m"
+  defp fmt_dur(s) when s < 36 * 3600, do: "#{Float.round(s / 3600, 1)}h"
+  defp fmt_dur(s), do: "#{Float.round(s / 86_400, 1)} days"
 end

@@ -86,7 +86,11 @@ defmodule MobiusSmartsTest do
       end)
 
     assert_in_delta baseline.target, 40.0, 0.5
-    assert %{level: :ok, learning: []} = MobiusSmarts.status(name)
+
+    assert %{level: :ok, metrics: [%{detection: :active, learning: nil} = armed]} =
+             MobiusSmarts.status(name)
+
+    assert :jump in armed.detectors
 
     # The metric shifts; ticks re-scan and confirm a drift.
     shifted =
