@@ -178,12 +178,29 @@ defmodule MobiusSmarts.BoardTest do
     assert %{level: :critical} = Board.status(name)
   end
 
-  test "three warnings count as degraded", %{name: name} do
+  test "three warning-level metrics count as degraded", %{name: name} do
     for metric <- ["a", "b", "c"] do
       Board.report(name, {metric, %{}}, @kinds, [candidate()])
     end
 
     assert %{level: :degraded} = Board.status(name)
+  end
+
+  test "many warnings on ONE metric stay :watch — correlated trouble is one cause (#11)",
+       %{name: name} do
+    # One physical event fans out across detectors (the 2026-06-11
+    # boot ramp produced six findings on two metrics). The level
+    # ladder counts affected metrics, not findings.
+    kinds = [:drifting_up, :wobbling, :shifted_up]
+
+    Board.report(name, @scope, kinds, [
+      candidate(%{kind: :drifting_up, message: "drift"}),
+      candidate(%{kind: :wobbling, detector: :jump, message: "wobble"}),
+      candidate(%{kind: :shifted_up, detector: :shift, message: "shift"})
+    ])
+
+    assert length(Board.findings(name)) == 3
+    assert %{level: :watch} = Board.status(name)
   end
 
   test "metrics report detection posture, learning progress, and armed detectors",

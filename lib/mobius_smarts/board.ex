@@ -336,17 +336,25 @@ defmodule MobiusSmarts.Board do
   # - :critical — a critical :approaching_limit (resource exhaustion
   #   has a date) is the device's own deadline.
   # - :degraded — any other critical condition, or correlated trouble
-  #   (3+ concurrent warnings).
+  #   (3+ warning-level METRICS — one physical event fans out across
+  #   detectors on the same metric, and that is one cause, not three;
+  #   issue #11).
   # - :watch — anything warning-level.
   defp level(active) do
     criticals = Enum.filter(active, &(&1.severity == :critical))
-    warnings = Enum.count(active, &(&1.severity == :warning))
+
+    warning_metrics =
+      active
+      |> Enum.filter(&(&1.severity == :warning))
+      |> Enum.map(&{&1.metric, &1.tags})
+      |> Enum.uniq()
+      |> length()
 
     cond do
       Enum.any?(criticals, &(&1.kind == :approaching_limit)) -> :critical
       criticals != [] -> :degraded
-      warnings >= 3 -> :degraded
-      warnings > 0 -> :watch
+      warning_metrics >= 3 -> :degraded
+      warning_metrics > 0 -> :watch
       true -> :ok
     end
   end
