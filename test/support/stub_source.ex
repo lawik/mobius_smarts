@@ -29,5 +29,21 @@ defmodule MobiusSmarts.StubSource do
     Source.from_summary_windows(windows)
   end
 
-  def sketch(_metric_name, _tags, _opts), do: {:error, :not_staged}
+  # Sketches are staged as `{:sketch, {name, tags}} => fun/1` in the
+  # same data map; the fun receives the sketch opts (so tests can
+  # assert on the requested windows) and returns the sketch result.
+  def sketch(metric_name, tags, opts) do
+    instance = Keyword.fetch!(opts, :mobius_instance)
+
+    case :persistent_term.get({__MODULE__, instance}, %{}) do
+      data when is_map(data) ->
+        case Map.get(data, {:sketch, {metric_name, tags}}) do
+          fun when is_function(fun, 1) -> fun.(opts)
+          nil -> {:error, :not_staged}
+        end
+
+      _fun ->
+        {:error, :not_staged}
+    end
+  end
 end

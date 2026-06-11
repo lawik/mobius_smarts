@@ -108,9 +108,14 @@ defmodule MobiusSmarts.Sweeper do
              to: baseline.to,
              mobius_instance: config.mobius_instance
            ),
+         # The current window covers only what the baseline has not
+         # seen: from its fit horizon forward. A trailing-window shape
+         # would contain the baseline period itself whenever the fit
+         # is recent — comparing the reference against a diluted
+         # superset of itself (issue #4).
          {:ok, current_sketch} <-
            config.source.sketch(metric.name, metric.tags,
-             last: config.analysis_window,
+             from: baseline.to,
              mobius_instance: config.mobius_instance
            ) do
       Analysis.shape_candidates(base_sketch, current_sketch)

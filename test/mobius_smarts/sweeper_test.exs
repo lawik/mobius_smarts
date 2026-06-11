@@ -95,4 +95,58 @@ defmodule MobiusSmarts.SweeperTest do
     # active drift is not learned as the new normal.
     assert %{fitted_at: ^stale_fitted_at} = Board.baseline(ctx.name, {@metric, @tags_a})
   end
+
+  test "the shape sweep compares disjoint windows: current starts at the fit horizon (#4)",
+       ctx do
+    now = System.system_time(:second)
+    parent = self()
+    name = :"#{ctx.name}_shape"
+
+    config =
+      Config.new!(
+        watch: [[metric: @metric, tags: @tags_a, histogram: true]],
+        source: StubSource,
+        mobius_instance: name,
+        resolution: {1, :minute},
+        false_alarm_every: {1, :week},
+        sweep_interval: {1, :hour},
+        min_baseline_windows: 20
+      )
+
+    start_supervised!(Supervisor.child_spec({Board, name: name, config: config}, id: name))
+    on_exit(fn -> StubSource.clear(name) end)
+
+    StubSource.stage(name, %{
+      {@metric, @tags_a} => healthy_windows(now, 33),
+      {:sketch, {@metric, @tags_a}} => fn opts ->
+        send(parent, {:sketch_request, Keyword.take(opts, [:from, :to, :last])})
+        {:error, :skip}
+      end
+    })
+
+    baseline = %{
+      target: 50.0,
+      sigma_avg: 0.5,
+      fitted_at: now - 60,
+      from: now - 7200,
+      to: now - 3600
+    }
+
+    Board.put_baseline(name, {@metric, @tags_a}, baseline)
+
+    run_sweep(name, config)
+
+    # The reference sketch is the baseline's own window...
+    assert_receive {:sketch_request, baseline_window}
+    assert baseline_window[:from] == now - 7200
+    assert baseline_window[:to] == now - 3600
+
+    # ...and the current sketch covers only what the baseline has NOT
+    # seen — from its fit horizon forward. A `last:`-shaped window
+    # would contain the baseline period itself, comparing the
+    # reference against a diluted superset of itself (issue #4).
+    assert_receive {:sketch_request, current_window}
+    assert current_window[:last] == nil
+    assert current_window[:from] == now - 3600
+  end
 end
