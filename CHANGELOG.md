@@ -84,5 +84,5 @@ configuration contract.
 ### Pre-release review history
 
 The detector math and runtime went through three review/fix passes
-before release; the records are in `CRITIQUE.md`, `QUALITY.md`, and
-`REVIEW.md`.
+before release; the records are kept as local working notes outside
+the published repo.

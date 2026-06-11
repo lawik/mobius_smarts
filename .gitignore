@@ -25,9 +25,12 @@ mobius_smarts-*.tar
 # macOS Finder metadata.
 .DS_Store
 
-# Local review/scratch notes — not part of the published library.
+# Local review/research/scratch notes — kept on disk, not part of the
+# published library.
+/CI-RESEARCH.md
 /CRITIQUE.md
 /FRIENDLY.md
+/PRIOR-ART.md
 /QUALITY.md
+/REVIEW.md
 /critique_probe.exs
-
