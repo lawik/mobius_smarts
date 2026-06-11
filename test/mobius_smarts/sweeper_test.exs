@@ -120,7 +120,10 @@ defmodule MobiusSmarts.SweeperTest do
       {@metric, @tags_a} => healthy_windows(now, 33),
       {:sketch, {@metric, @tags_a}} => fn opts ->
         send(parent, {:sketch_request, Keyword.take(opts, [:from, :to, :last])})
-        {:error, :skip}
+        # The reference window must succeed or the sweep never requests
+        # the current one; the current request may fail — this test
+        # pins the requested windows, not the shape math.
+        if opts[:to], do: {:ok, :stub_sketch}, else: {:error, :skip}
       end
     })
 
