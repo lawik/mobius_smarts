@@ -184,6 +184,24 @@ defmodule MobiusSmarts do
   @spec status(atom()) :: map()
   def status(name \\ __MODULE__), do: Board.status(name)
 
+  @doc """
+  Print the instance's health as a CLI-friendly report — `status/1`
+  plus the freshest observations, formatted for an IEx-over-SSH
+  session. Returns `:ok`.
+
+      MobiusSmarts.report()
+      #
+      # MobiusSmarts — DEGRADED — concern 57.9 — since 2026-06-10 22:54Z
+      #
+      #   crit    57.9×  drifting_up  vm.memory.total
+      #                  drifting up since ~06:44Z (evidence 661.27 of 11.42 σ·windows)
+      #   ...
+  """
+  @spec report(atom()) :: :ok
+  def report(name \\ __MODULE__) do
+    IO.puts(MobiusSmarts.Report.render(status(name), observations(name, 5)))
+  end
+
   @doc "Active conditions, worst first."
   @spec findings(atom()) :: [MobiusSmarts.Finding.t()]
   def findings(name \\ __MODULE__), do: Board.findings(name)
