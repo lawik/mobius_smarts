@@ -40,6 +40,10 @@ defmodule MobiusSmarts.Report do
 
   defp state_cell(%{detection: :active}), do: "active"
 
+  defp state_cell(%{detection: :unstable, learning: progress}) do
+    "unstable: won't settle (#{progress.windows}/#{progress.needed})"
+  end
+
   defp state_cell(%{learning: %{reason: :no_data}}), do: "no data yet"
 
   defp state_cell(%{learning: %{reason: :trending}}), do: "learning: still ramping"

@@ -140,12 +140,13 @@ defmodule MobiusSmarts.Analysis do
   def fit_baseline(lists, opts) do
     min_windows = Keyword.fetch!(opts, :min_windows)
     now = Keyword.fetch!(opts, :now)
+    seen = length(lists.avg)
 
-    if length(lists.avg) < min_windows do
-      {:error, progress(:insufficient, length(lists.avg), min_windows)}
+    if seen < min_windows do
+      {:error, progress(:insufficient, seen, min_windows, seen)}
     else
       segment = settled_segment(lists)
-      fit_settled(segment, sliced_from_trending?(lists, segment), min_windows, now)
+      fit_settled(segment, sliced_from_trending?(lists, segment), min_windows, now, seen)
     end
   end
 
@@ -174,16 +175,16 @@ defmodule MobiusSmarts.Analysis do
   @halves_t_limit 3.0
   @suspicious_halves_t_limit 2.0
 
-  defp fit_settled(segment, suspicious?, min_windows, now) do
+  defp fit_settled(segment, suspicious?, min_windows, now, seen) do
     settled = length(segment.avg)
     halves_limit = if suspicious?, do: @suspicious_halves_t_limit, else: @halves_t_limit
 
     cond do
       settled < min_windows ->
-        {:error, progress(:unsettled, settled, min_windows)}
+        {:error, progress(:unsettled, settled, min_windows, seen)}
 
       Trend.mann_kendall(segment.avg, alpha: @trend_gate_alpha).trend != :none ->
-        {:error, progress(:trending, settled, min_windows)}
+        {:error, progress(:trending, settled, min_windows, seen)}
 
       # The changepoint slice can dice a long steep ramp into steps
       # whose tail falls under Mann-Kendall significance (issue #14);
@@ -191,12 +192,12 @@ defmodule MobiusSmarts.Analysis do
       # disagreeing. A flat tail after an old, genuine step passes —
       # this only refuses stretches that are still moving.
       not halves_stable?(segment.avg, halves_limit) ->
-        {:error, progress(:trending, settled, min_windows)}
+        {:error, progress(:trending, settled, min_windows, seen)}
 
       true ->
         case do_fit(segment, now) do
           {:ok, baseline} -> {:ok, baseline}
-          {:error, reason} -> {:error, progress(reason, settled, min_windows)}
+          {:error, reason} -> {:error, progress(reason, settled, min_windows, seen)}
         end
     end
   end
@@ -221,8 +222,11 @@ defmodule MobiusSmarts.Analysis do
     {mean, var, n}
   end
 
-  defp progress(reason, windows, needed) do
-    %{reason: reason, windows: windows, needed: needed}
+  # `seen` is how many windows the whole candidate stretch held — the
+  # Board reads abundant-data-yet-still-failing as :unstable (issue
+  # #13): the metric's character changes faster than it can settle.
+  defp progress(reason, windows, needed, seen) do
+    %{reason: reason, windows: windows, needed: needed, seen: seen}
   end
 
   defp settled_segment(lists) do

@@ -150,13 +150,13 @@ defmodule MobiusSmarts.HarnessTest do
     end
   end
 
-  describe "baseline starvation on choppy metrics (#13)" do
-    test "CURRENT BEHAVIOR #13: character changes faster than min_baseline_windows never fit" do
+  describe "baseline starvation on choppy metrics (fixed: #13)" do
+    test "chronic instability is named :unstable instead of a forever-resetting countdown" do
       # A binary-memory-shaped metric: the level steps every 20 minutes
-      # as sessions come and go. The honest gates refuse every stretch
-      # (changepoint :unsettled before 60 settled windows accrue), so
-      # six hours pass with the chart stack never armed and only a
-      # perpetually resetting countdown to show for it.
+      # as sessions come and go. The honest gates still refuse every
+      # stretch — no baseline beats a wrong one — but with twice the
+      # needed evidence seen and still no settling, the posture says
+      # what is actually happening.
       windows =
         Synthetic.series(
           seed: 6,
@@ -169,7 +169,10 @@ defmodule MobiusSmarts.HarnessTest do
       result = Replay.run(windows, config: [false_alarm_every: {1, :week}])
 
       assert result.baseline == nil
-      assert [%{detection: :learning, learning: %{reason: reason}}] = result.status.metrics
+
+      assert [%{detection: :unstable, learning: %{reason: reason, eta_s: nil}}] =
+               result.status.metrics
+
       assert reason in [:unsettled, :trending]
     end
   end

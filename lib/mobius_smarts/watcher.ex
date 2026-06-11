@@ -105,7 +105,8 @@ defmodule MobiusSmarts.Watcher do
         Board.put_learning(state.board, key, %{
           reason: :no_data,
           windows: 0,
-          needed: config.min_baseline_windows
+          needed: config.min_baseline_windows,
+          seen: 0
         })
 
         Board.report(state.board, key, @tick_kinds, [Analysis.silent_candidate(nil, now)])

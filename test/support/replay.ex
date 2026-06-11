@@ -111,7 +111,8 @@ defmodule MobiusSmarts.Replay do
         Board.put_learning(name, key, %{
           reason: :no_data,
           windows: 0,
-          needed: config.min_baseline_windows
+          needed: config.min_baseline_windows,
+          seen: 0
         })
 
         Board.report(name, key, @tick_kinds, [Analysis.silent_candidate(nil, now)])

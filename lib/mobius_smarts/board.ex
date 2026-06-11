@@ -379,22 +379,42 @@ defmodule MobiusSmarts.Board do
       else
         progress =
           lookup(state.table, {:learning, key}) ||
-            %{reason: :no_data, windows: 0, needed: state.config.min_baseline_windows}
+            %{reason: :no_data, windows: 0, needed: state.config.min_baseline_windows, seen: 0}
+
+        detection = detection_state(progress)
+
+        learning =
+          if detection == :unstable do
+            # An ETA would be a lie: the clock keeps resetting.
+            Map.put(progress, :eta_s, nil)
+          else
+            with_eta(progress, state.config)
+          end
 
         %{
           metric: metric.name,
           tags: metric.tags,
-          detection: detection_state(progress.reason),
+          detection: detection,
           detectors: armed_detectors(metric, nil),
-          learning: with_eta(progress, state.config)
+          learning: learning
         }
       end
     end
   end
 
   # No amount of waiting fits a baseline on data with nothing to model.
-  defp detection_state(reason) when reason in [:no_dispersion, :zero_variance], do: :blocked
-  defp detection_state(_reason), do: :learning
+  defp detection_state(%{reason: reason}) when reason in [:no_dispersion, :zero_variance],
+    do: :blocked
+
+  # Abundant data that still will not settle: the metric's character
+  # changes faster than min_baseline_windows of stability allows
+  # (issue #13) — chronically unmonitorable by the chart stack, and
+  # named as such instead of showing a forever-resetting countdown.
+  defp detection_state(%{reason: reason, seen: seen, needed: needed})
+       when reason in [:unsettled, :trending] and seen >= 2 * needed,
+       do: :unstable
+
+  defp detection_state(_progress), do: :learning
 
   defp with_eta(%{reason: reason} = progress, config)
        when reason in [:insufficient, :unsettled] do

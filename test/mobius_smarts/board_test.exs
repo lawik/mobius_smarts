@@ -222,6 +222,17 @@ defmodule MobiusSmarts.BoardTest do
     Board.put_learning(name, {"m", %{}}, %{reason: :no_dispersion, windows: 80, needed: 60})
     assert %{metrics: [%{detection: :blocked, learning: %{eta_s: nil}}]} = Board.status(name)
 
+    # Abundant data that still won't settle is :unstable — and an ETA
+    # would be a lie, so it carries none (#13).
+    Board.put_learning(name, {"m", %{}}, %{
+      reason: :unsettled,
+      windows: 20,
+      needed: 60,
+      seen: 120
+    })
+
+    assert %{metrics: [%{detection: :unstable, learning: %{eta_s: nil}}]} = Board.status(name)
+
     # A fitted baseline arms the gated detectors and clears the progress.
     Board.put_baseline(name, {"m", %{}}, %{target: 1.0, sigma_avg: 0.1, fitted_at: 0})
     assert %{metrics: [armed]} = Board.status(name)
