@@ -519,6 +519,30 @@ defmodule MobiusSmarts.AnalysisTest do
       assert candidate.concern > 1.0
     end
 
+    test "novelty concern is the square root of the score ratio (#10)" do
+      # Mahalanobis distances explode along the model's tight
+      # directions in a way band-ratio concerns do not (96x observed
+      # on-device while every other detector topped out far lower);
+      # the square root keeps crossings at 1.0 and ordering intact
+      # while damping the blowout into the shared concern scale.
+      series =
+        for {key, base} <- [{"a", 1.0}, {"b", 2.0}] do
+          {{key, %{}},
+           %{
+             ts: Enum.map(0..19, &(&1 * 60)),
+             avg: Enum.map(0..19, &(base * (&1 + 1.0) + rem(&1, 3) * 0.1)),
+             std: [],
+             reports: []
+           }}
+        end
+
+      assert {:ok, model} = Analysis.fit_novelty(series, 1000.0)
+      assert [candidate] = Analysis.novelty_candidates(model, [34.0, 20.0])
+
+      score = candidate.evidence.score
+      assert_in_delta candidate.concern, :math.sqrt(score / model.threshold), 1.0e-9
+    end
+
     test "refuses to fit on too few aligned rows" do
       series = [
         {{"a", %{}}, %{ts: [0, 60], avg: [1.0, 2.0], std: [], reports: []}},

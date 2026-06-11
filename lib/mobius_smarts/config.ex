@@ -27,7 +27,10 @@ defmodule MobiusSmarts.Config do
     device the whole instance may cry wolf about once per this
     duration. `{1, :week}` is one false alarm a week; `{2, :week}` is
     one every two weeks. Every detector threshold derives from this
-    one tolerance and `:resolution` (`MobiusSmarts.Calibrate`).
+    one tolerance and `:resolution` (`MobiusSmarts.Calibrate`). The
+    rate is exact on ideal (independent, stationary) data and
+    directional on real telemetry — `MobiusSmarts.Calibrate` states
+    precisely what is and is not guaranteed.
 
   And one more becomes required when you opt into ETA projections:
 

@@ -23,6 +23,25 @@ defmodule MobiusSmarts.Calibrate do
   comparable across detectors — which is what makes the aggregate
   health level honest.
 
+  ## What the budget actually guarantees
+
+  The ARL math assumes independent, stationary, near-Gaussian
+  windows. On data like that the budget is *accurate*: the synthetic
+  replay harness measures 0 realized false alarms over 3 days of
+  i.i.d. Gaussian minute-windows at a `{1, :day}` budget (slightly
+  conservative, as the Bonferroni split predicts). Real device
+  telemetry violates those assumptions — the same harness measures
+  ~3x the budget on AR(1)-wandering data (phi 0.995) — so on real
+  metrics treat the budget as *directional*: `{1, :day}` is reliably
+  more sensitive than `{1, :week}`, but neither is a contract.
+  Removing autocorrelation at the source (seasonal/residual modeling,
+  issue #8) is what makes the absolute rate truthful, not tuning the
+  budget.
+
+  One coupling to know about: the Bonferroni split divides the budget
+  across every alarm stream, so adding a metric to `:watch` slightly
+  tightens every other detector.
+
   Two stated approximations:
 
   - The EWMA limit reuses the normal-tail inversion. The EWMA

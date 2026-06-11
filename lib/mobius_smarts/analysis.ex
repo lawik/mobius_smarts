@@ -770,7 +770,15 @@ defmodule MobiusSmarts.Analysis do
     score = Novelty.score(model_map.model, vector)
 
     if score > model_map.threshold do
-      concern = score / model_map.threshold
+      # Provisional damping (issue #10): Mahalanobis distances explode
+      # along the model's tight covariance directions in a way the
+      # band-ratio concerns of the other detectors do not (96x observed
+      # on-device while drift topped out at 58x for the same event).
+      # The square root keeps the crossing at 1.0 and the ordering
+      # intact while pulling the blowout into the shared scale. To be
+      # revisited with measured cross-detector comparisons once the
+      # replay harness can drive multi-metric novelty scenarios.
+      concern = :math.sqrt(score / model_map.threshold)
 
       [
         %{

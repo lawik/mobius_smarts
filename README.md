@@ -89,7 +89,11 @@ false-alarm budget (`false_alarm_every: {1, :week}` — "this device may cry
 wolf about once a week") and the window cadence it is counted in
 (`resolution:`), and every detector's threshold is derived from those two
 via that detector's average-run-length math; the derived numbers are logged
-once at startup. Baselines are fitted from the device's own stored history.
+once at startup. The budget is exact on ideal (independent, stationary)
+data — measured, not assumed: the synthetic replay harness realizes 0 false
+alarms over 3 i.i.d. days at a `{1, :day}` budget — and directional on real
+telemetry; `MobiusSmarts.Calibrate` states what is and is not guaranteed.
+Baselines are fitted from the device's own stored history.
 Findings surface through `MobiusSmarts.status/0` and telemetry events —
 what to do with them (alarms, notifications, persistence) is the host
 app's call. The `MobiusSmarts` moduledoc has the full story: learning,
