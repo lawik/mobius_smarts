@@ -80,6 +80,23 @@ defmodule MobiusSmarts.Analysis do
     }
   end
 
+  @doc """
+  The series strictly after `ts` — empty-listed when nothing is newer.
+
+  Detectors only score windows the baseline has not already
+  adjudicated (its `:to` horizon): everything before it was either
+  part of the fitted pool or rejected by it, and re-scoring it against
+  the new target manufactures findings about the past (the boot-ramp
+  phantom-drift incident, issue #2).
+  """
+  @spec since(lists(), integer()) :: lists()
+  def since(lists, ts) do
+    case Enum.find_index(lists.ts, &(&1 > ts)) do
+      nil -> %{ts: [], avg: [], std: [], reports: []}
+      from -> slice(lists, from)
+    end
+  end
+
   ## Baseline lifecycle
 
   @doc """
@@ -100,9 +117,20 @@ defmodule MobiusSmarts.Analysis do
     `windows` is how many exist, so the remainder is a real ETA.
   - `:unsettled` — a recent regime change; `windows` counts the
     homogeneous stretch since it, which must reach `needed`.
-  - `:no_dispersion` / `:zero_variance` — the data carries nothing to
-    model (all singleton windows / a constant series); waiting longer
-    changes nothing unless the metric's behavior does.
+  - `:trending` — the candidate stretch carries a statistically
+    significant monotonic trend (Mann–Kendall at alpha 0.01). The
+    changepoint check catches steps, not smooth ramps; freezing a
+    mid-ramp target makes the pre-fit ramp read as massive drift one
+    way and the continuing rise alarm the other (issue #3). No ETA —
+    learning resumes when the ramp flattens.
+  - `:no_dispersion` — every window is a singleton; there is no
+    within-window dispersion to pool, and waiting longer changes
+    nothing unless the metric's behavior does.
+
+  A constant series (zero variance across window averages) is not an
+  error: it fits a *degenerate* baseline (`degenerate: true`) — the
+  sigma charts stay dark and `departure_candidates/2` watches for the
+  value leaving its constant instead (issue #6).
   """
   @spec fit_baseline(lists(), keyword()) ::
           {:ok, map()}
@@ -118,16 +146,26 @@ defmodule MobiusSmarts.Analysis do
     end
   end
 
+  # Stricter than detection's default 0.05: a false :trending only
+  # delays learning by a tick, but persistently gating a stationary
+  # metric on a spurious trend call would hold up detection entirely.
+  @trend_gate_alpha 0.01
+
   defp fit_settled(segment, min_windows, now) do
     settled = length(segment.avg)
 
-    if settled < min_windows do
-      {:error, progress(:unsettled, settled, min_windows)}
-    else
-      case do_fit(segment, now) do
-        {:ok, baseline} -> {:ok, baseline}
-        {:error, reason} -> {:error, progress(reason, settled, min_windows)}
-      end
+    cond do
+      settled < min_windows ->
+        {:error, progress(:unsettled, settled, min_windows)}
+
+      Trend.mann_kendall(segment.avg, alpha: @trend_gate_alpha).trend != :none ->
+        {:error, progress(:trending, settled, min_windows)}
+
+      true ->
+        case do_fit(segment, now) do
+          {:ok, baseline} -> {:ok, baseline}
+          {:error, reason} -> {:error, progress(reason, settled, min_windows)}
+        end
     end
   end
 
@@ -159,16 +197,22 @@ defmodule MobiusSmarts.Analysis do
 
     baseline = Jump.baseline(kept.avg, kept.std, kept.reports)
 
+    meta = %{
+      fitted_at: now,
+      windows: length(kept.avg),
+      from: List.first(segment.ts),
+      to: List.last(segment.ts)
+    }
+
     if baseline.sigma_avg > 0.0 do
-      {:ok,
-       Map.merge(baseline, %{
-         fitted_at: now,
-         windows: length(kept.avg),
-         from: List.first(segment.ts),
-         to: List.last(segment.ts)
-       })}
+      {:ok, Map.merge(baseline, meta)}
     else
-      {:error, :zero_variance}
+      # A constant series: the sigma charts have nothing to price, but
+      # the metric is trivially monitorable — any departure from the
+      # learned constant is signal (issue #6). The runtime arms
+      # `departure_candidates/2` for degenerate baselines instead of
+      # the chart stack.
+      {:ok, baseline |> Map.merge(meta) |> Map.put(:degenerate, true)}
     end
   rescue
     # Jump.baseline raises when no window carries dispersion information
@@ -209,36 +253,53 @@ defmodule MobiusSmarts.Analysis do
     result =
       Jump.scan(lists.avg, lists.std, lists.reports, baseline: baseline, limit: calib.jump_limit)
 
-    jumps = Nx.to_flat_list(result.jumps)
-    wobbles = Nx.to_flat_list(result.wobbles)
-    jump_ucl = Nx.to_flat_list(result.jump_ucl)
-    jump_lcl = Nx.to_flat_list(result.jump_lcl)
-    wobble_ucl = Nx.to_flat_list(result.wobble_ucl)
-    wobble_lcl = Nx.to_flat_list(result.wobble_lcl)
+    charts = %{
+      jumps: Nx.to_flat_list(result.jumps),
+      wobbles: Nx.to_flat_list(result.wobbles),
+      jump_ucl: Nx.to_flat_list(result.jump_ucl),
+      jump_lcl: Nx.to_flat_list(result.jump_lcl),
+      wobble_ucl: Nx.to_flat_list(result.wobble_ucl),
+      wobble_lcl: Nx.to_flat_list(result.wobble_lcl)
+    }
+
+    spike_observations(lists, charts) ++
+      jumped_condition(lists, charts, baseline) ++
+      spread_conditions(lists, charts)
+  end
+
+  defp spike_observations(lists, charts) do
     last = length(lists.avg) - 1
 
-    spikes =
-      for {1, i} <- Enum.with_index(jumps), i < last do
-        ts = Enum.at(lists.ts, i)
-        value = Enum.at(lists.avg, i)
+    for {1, i} <- Enum.with_index(charts.jumps), i < last do
+      ts = Enum.at(lists.ts, i)
+      value = Enum.at(lists.avg, i)
 
-        %{
-          kind: :spiked,
-          detector: :jump,
-          class: :observation,
-          severity: :info,
-          concern: 0.0,
-          onset: ts,
-          evidence: %{value: value, ucl: Enum.at(jump_ucl, i), lcl: Enum.at(jump_lcl, i)},
-          message: "spiked to #{round2(value)} at #{fmt_ts(ts)}, then returned"
-        }
-      end
+      %{
+        kind: :spiked,
+        detector: :jump,
+        class: :observation,
+        severity: :info,
+        concern: 0.0,
+        onset: ts,
+        evidence: %{
+          value: value,
+          ucl: Enum.at(charts.jump_ucl, i),
+          lcl: Enum.at(charts.jump_lcl, i)
+        },
+        message: "spiked to #{round2(value)} at #{fmt_ts(ts)}, then returned"
+      }
+    end
+  end
 
-    jumped =
-      if Enum.at(jumps, last) == 1 do
-        value = Enum.at(lists.avg, last)
-        ucl = Enum.at(jump_ucl, last)
-        lcl = Enum.at(jump_lcl, last)
+  defp jumped_condition(lists, charts, baseline) do
+    case persistent_violation(charts.jumps) do
+      nil ->
+        []
+
+      {first_i, last_i} ->
+        value = Enum.at(lists.avg, last_i)
+        ucl = Enum.at(charts.jump_ucl, last_i)
+        lcl = Enum.at(charts.jump_lcl, last_i)
         half = (ucl - lcl) / 2.0
         concern = abs(value - baseline.target) / max(half, 1.0e-12)
 
@@ -249,31 +310,41 @@ defmodule MobiusSmarts.Analysis do
             class: :condition,
             severity: :critical,
             concern: concern,
-            onset: Enum.at(lists.ts, last),
+            onset: Enum.at(lists.ts, first_i),
             evidence: %{value: value, ucl: ucl, lcl: lcl, target: baseline.target},
             message:
               "at #{round2(value)}, outside its band (#{round2(lcl)}–#{round2(ucl)}) right now"
           }
         ]
-      else
-        []
-      end
+    end
+  end
+
+  defp spread_conditions(lists, charts) do
+    # Above the band: how many UCLs of spread (unbounded is fine —
+    # std really can be arbitrarily large). Below the band: measure
+    # the shortfall in band-half-widths, mirroring how :jumped and
+    # :shifted_* scale by half the band. Exactly 1.0 at the lower
+    # limit, growing linearly as the spread collapses, and bounded
+    # (1 + lcl/band_half) even at std = 0 — a ratio against std
+    # would explode toward 1e12 for a stuck sensor and poison the
+    # Board's max-concern aggregation across detectors.
+    above =
+      Enum.zip_with([charts.wobbles, lists.std, charts.wobble_ucl], fn [w, std, ucl] ->
+        if w == 1 and std > ucl, do: 1, else: 0
+      end)
+
+    below =
+      Enum.zip_with(charts.wobbles, above, fn w, a -> if w == 1 and a == 0, do: 1, else: 0 end)
 
     wobbling =
-      if Enum.at(wobbles, last) == 1 do
-        std = Enum.at(lists.std, last)
-        ucl = Enum.at(wobble_ucl, last)
-        lcl = Enum.at(wobble_lcl, last)
+      case persistent_violation(above) do
+        nil ->
+          []
 
-        # Above the band: how many UCLs of spread (unbounded is fine —
-        # std really can be arbitrarily large). Below the band: measure
-        # the shortfall in band-half-widths, mirroring how :jumped and
-        # :shifted_* scale by half the band. Exactly 1.0 at the lower
-        # limit, growing linearly as the spread collapses, and bounded
-        # (1 + lcl/band_half) even at std = 0 — a ratio against std
-        # would explode toward 1e12 for a stuck sensor and poison the
-        # Board's max-concern aggregation across detectors.
-        if std > ucl do
+        {first_i, last_i} ->
+          std = Enum.at(lists.std, last_i)
+          ucl = Enum.at(charts.wobble_ucl, last_i)
+          lcl = Enum.at(charts.wobble_lcl, last_i)
           concern = std / max(ucl, 1.0e-12)
 
           [
@@ -283,20 +354,30 @@ defmodule MobiusSmarts.Analysis do
               class: :condition,
               severity: severity_from(concern),
               concern: concern,
-              onset: Enum.at(lists.ts, last),
+              onset: Enum.at(lists.ts, first_i),
               evidence: %{std_dev: std, ucl: ucl, lcl: lcl},
               message:
                 "within-window spread at #{round2(std)}, above its band " <>
                   "(#{round2(lcl)}–#{round2(ucl)}) — erratic, a pre-failure signature"
             }
           ]
-        else
+      end
+
+    # Only reachable when the baseline pool had spread in every
+    # window (Jump disarms the lower limit otherwise), so a
+    # collapse really is anomalous for this metric.
+    flatlined =
+      case persistent_violation(below) do
+        nil ->
+          []
+
+        {first_i, last_i} ->
+          std = Enum.at(lists.std, last_i)
+          ucl = Enum.at(charts.wobble_ucl, last_i)
+          lcl = Enum.at(charts.wobble_lcl, last_i)
           band_half = (ucl - lcl) / 2.0
           concern = 1.0 + (lcl - std) / max(band_half, 1.0e-12)
 
-          # Only reachable when the baseline pool had spread in every
-          # window (Jump disarms the lower limit otherwise), so a
-          # collapse really is anomalous for this metric.
           [
             %{
               kind: :flatlined,
@@ -304,19 +385,40 @@ defmodule MobiusSmarts.Analysis do
               class: :condition,
               severity: severity_from(concern),
               concern: concern,
-              onset: Enum.at(lists.ts, last),
+              onset: Enum.at(lists.ts, first_i),
               evidence: %{std_dev: std, ucl: ucl, lcl: lcl},
               message:
                 "within-window spread collapsed to #{round2(std)}, below its healthy " <>
                   "floor #{round2(lcl)} — flat, stuck-signal signature"
             }
           ]
-        end
-      else
-        []
       end
 
-    spikes ++ jumped ++ wobbling
+    wobbling ++ flatlined
+  end
+
+  # k-of-n persistence (issue #7): a Jump-side condition needs
+  # @persistence_k of the trailing @persistence_n windows beyond the
+  # limit before it raises — single excursions stay observations, the
+  # universal practice in shipped systems (RRDtool 7-of-9, Dynatrace
+  # 3-of-5). CUSUM and EWMA carry persistence in their own math.
+  # Returns `{first_index, last_index}` of the flagged windows inside
+  # the trailing stretch, or nil. The thresholds stay budget-derived;
+  # persistence only makes the realized rate more conservative.
+  @persistence_k 3
+  @persistence_n 5
+
+  defp persistent_violation(flags) do
+    trailing_start = max(length(flags) - @persistence_n, 0)
+
+    flagged =
+      for {1, i} <- Enum.with_index(flags), i >= trailing_start, do: i
+
+    if length(flagged) >= @persistence_k do
+      {List.first(flagged), List.last(flagged)}
+    else
+      nil
+    end
   end
 
   defp shift_candidates(lists, baseline, calib, config) do
@@ -370,8 +472,34 @@ defmodule MobiusSmarts.Analysis do
     upper = Nx.to_flat_list(result.upper)
     lower = Nx.to_flat_list(result.lower)
 
-    drift_side(:drifting_up, List.last(upper), result.upper_onset, lists, calib) ++
-      drift_side(:drifting_down, List.last(lower), result.lower_onset, lists, calib)
+    up = drift_side(:drifting_up, List.last(upper), result.upper_onset, lists, calib)
+    down = drift_side(:drifting_down, List.last(lower), result.lower_onset, lists, calib)
+
+    case {up, down} do
+      # Both CUSUM sides over threshold in one scan is not two drifts —
+      # it is the series moving on both sides of a target that no
+      # longer describes it (issue #5). One honest observation; the
+      # runtime drops the baseline and relearns.
+      {[_ | _], [_ | _]} -> [baseline_stale_candidate(lists, baseline)]
+      _one_or_none -> up ++ down
+    end
+  end
+
+  defp baseline_stale_candidate(lists, baseline) do
+    onset = List.last(lists.ts)
+
+    %{
+      kind: :baseline_stale,
+      detector: :drift,
+      class: :observation,
+      severity: :info,
+      concern: 0.0,
+      onset: onset,
+      evidence: %{target: baseline.target, fitted_at: baseline[:fitted_at]},
+      message:
+        "level moved on both sides of its baseline (target #{round2(baseline.target)}) — " <>
+          "dropping it and relearning"
+    }
   end
 
   defp drift_side(kind, bucket, onset_index, lists, calib) do
@@ -396,6 +524,49 @@ defmodule MobiusSmarts.Analysis do
       ]
     else
       []
+    end
+  end
+
+  @doc """
+  Candidates for a degenerate (constant) baseline: the sigma charts
+  have nothing to price, but any departure from the learned constant
+  is signal (issue #6). Uses the same k-of-n persistence as the
+  Jump-side conditions, so a single odd window stays quiet.
+
+  Concern is a flat 1.0 — with zero learned variance there is no
+  scale to price the departure against.
+  """
+  @spec departure_candidates(lists(), map()) :: [candidate()]
+  def departure_candidates(%{avg: []}, _baseline), do: []
+
+  def departure_candidates(lists, baseline) do
+    target = baseline.target
+    tolerance = max(abs(target) * 1.0e-9, 1.0e-9)
+
+    flags =
+      Enum.map(lists.avg, fn avg -> if abs(avg - target) > tolerance, do: 1, else: 0 end)
+
+    case persistent_violation(flags) do
+      nil ->
+        []
+
+      {first_i, last_i} ->
+        value = Enum.at(lists.avg, last_i)
+        onset = Enum.at(lists.ts, first_i)
+
+        [
+          %{
+            kind: :departed,
+            detector: :departure,
+            class: :condition,
+            severity: :warning,
+            concern: 1.0,
+            onset: onset,
+            evidence: %{value: value, constant: target},
+            message:
+              "left its constant #{round2(target)} (now #{round2(value)}) at #{fmt_ts(onset)}"
+          }
+        ]
     end
   end
 

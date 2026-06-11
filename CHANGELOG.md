@@ -61,6 +61,38 @@ forecast is never extrapolated from an hour of data. Findings carry
 onset, a cross-detector `concern` ratio, evidence, and a human message;
 lifecycle and health events emit via telemetry.
 
+### Detection honesty (the first harness-driven fix wave)
+
+Five defects reproduced from a real device by the synthetic replay
+harness, each pinned by a test that flipped with its fix:
+
+- Tick detectors score only windows after the baseline's fit horizon
+  (`baseline.to`) — re-scoring already-adjudicated history against a
+  newer target manufactured phantom drift findings about the past
+  (the boot-ramp incident, #2).
+- The baseline fit refuses stretches with a significant monotonic
+  trend (Mann–Kendall at alpha 0.01): the changepoint check catches
+  steps, not smooth ramps, and a mid-ramp target is wrong at birth.
+  Surfaced as the `:trending` learning reason — "still ramping" (#3).
+- Both CUSUM sides over threshold in one scan collapse into a single
+  `:baseline_stale` observation and the baseline is dropped for
+  relearning; directional kind pairs (`shifted_*`, `drifting_*`)
+  displace each other immediately instead of coexisting (#5).
+- Constant metrics fit a *degenerate* baseline instead of blocking on
+  zero variance: the sigma charts stay dark and a `:departed`
+  condition watches for the value leaving its learned constant —
+  previously the one observable event on such metrics was the one
+  thing detection was blind to (#6).
+- Jump-side conditions (`:jumped`/`:wobbling`/`:flatlined`) need
+  k-of-n persistence (3 of the trailing 5 windows) before raising;
+  single excursions stay `:spiked` observations. CUSUM/EWMA carry
+  persistence in their own math already (#7).
+
+Calibration after the wave (3 days, `{1, :day}` budget): ideal
+i.i.d. data realizes 0 false alarms; AR(1) wander (phi 0.995)
+realizes 10 — down from 18 — with the remaining divergence being the
+autocorrelation the seasonal/residual work (#8) targets.
+
 ### Source — `MobiusSmarts.Source`
 
 Mobius data as Nx tensors: per-window summary series (average/std_dev/

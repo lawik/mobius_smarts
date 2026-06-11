@@ -18,6 +18,7 @@ defmodule MobiusSmarts.Watcher do
     :spiked,
     :wobbling,
     :flatlined,
+    :departed,
     :shifted_up,
     :shifted_down,
     :drifting_up,
@@ -130,6 +131,12 @@ defmodule MobiusSmarts.Watcher do
               detector_candidates(state, key, segment, now)
             end
 
+        # A stale-baseline observation is also an instruction: drop the
+        # target and relearn from current history (issue #5).
+        if Enum.any?(candidates, &(&1.kind == :baseline_stale)) do
+          Board.drop_baseline(state.board, key)
+        end
+
         Board.report(state.board, key, @tick_kinds, candidates)
 
         # A stale metric contributes nothing to the novelty vector: its
@@ -171,8 +178,19 @@ defmodule MobiusSmarts.Watcher do
 
   defp detector_candidates(state, key, segment, now) do
     case Board.baseline(state.board, key) || fit_baseline(state, key, segment, now) do
-      nil -> []
-      baseline -> Analysis.tick_candidates(segment, baseline, state.calib, state.config)
+      nil ->
+        []
+
+      baseline ->
+        # Only windows after the fit horizon — the baseline already
+        # adjudicated everything up to its :to (issue #2).
+        fresh = Analysis.since(segment, baseline.to)
+
+        if baseline[:degenerate] do
+          Analysis.departure_candidates(fresh, baseline)
+        else
+          Analysis.tick_candidates(fresh, baseline, state.calib, state.config)
+        end
     end
   end
 

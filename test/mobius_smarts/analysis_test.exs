@@ -123,10 +123,22 @@ defmodule MobiusSmarts.AnalysisTest do
                Analysis.fit_baseline(lists, min_windows: 60, now: 0)
     end
 
-    test "a perfectly constant series has no variance to calibrate against" do
+    test "a perfectly constant series fits a degenerate baseline (#6)" do
       lists = windows(List.duplicate(42.0, 100), std: 0.0)
 
-      assert {:error, %{reason: :zero_variance, windows: 100, needed: 60}} =
+      assert {:ok, baseline} = Analysis.fit_baseline(lists, min_windows: 60, now: 0)
+      assert baseline.degenerate
+      assert baseline.target == 42.0
+    end
+
+    test "a smooth ramp is refused with :trending — never a mid-ramp target (#3)" do
+      seeded(18)
+      # Gentle enough that the changepoint check cannot slice it into
+      # steps, monotonic enough that Mann-Kendall is unambiguous.
+      values = Enum.map(0..179, fn w -> 50.0 + 0.001 * w + noise(0.25) end)
+      lists = windows(values)
+
+      assert {:error, %{reason: :trending, needed: 60}} =
                Analysis.fit_baseline(lists, min_windows: 60, now: 0)
     end
 
@@ -221,11 +233,19 @@ defmodule MobiusSmarts.AnalysisTest do
       assert drifting.onset == Enum.at(lists.ts, 29)
     end
 
-    test "a jump in the last window is a :jumped condition; an old one is a :spiked observation" do
+    test "a sustained excursion is :jumped; an old blip is a :spiked observation (k-of-n, #7)" do
       seeded(24)
       values = Enum.map(1..100, fn _ -> 50.0 + noise(0.18) end)
       values = List.replace_at(values, 49, 58.0)
-      values = List.replace_at(values, 99, 57.0)
+      # Three of the trailing five windows beyond the band: enough for
+      # the k-of-n persistence gate. A single excursion stays an
+      # observation (see the dedicated test below).
+      values =
+        values
+        |> List.replace_at(97, 57.0)
+        |> List.replace_at(98, 57.0)
+        |> List.replace_at(99, 57.0)
+
       lists = windows(values, std: 1.0)
 
       candidates =
@@ -237,6 +257,18 @@ defmodule MobiusSmarts.AnalysisTest do
       assert spiked = Enum.find(candidates, &(&1.kind == :spiked))
       assert spiked.class == :observation
       assert spiked.onset == Enum.at(lists.ts, 49)
+    end
+
+    test "a single trailing excursion does not raise :jumped (k-of-n, #7)" do
+      seeded(27)
+      values = Enum.map(1..100, fn _ -> 50.0 + noise(0.18) end)
+      values = List.replace_at(values, 99, 57.0)
+      lists = windows(values, std: 1.0)
+
+      candidates =
+        Analysis.tick_candidates(lists, healthy_baseline(50.0, 0.2), calib(), config())
+
+      refute Enum.find(candidates, &(&1.kind == :jumped))
     end
 
     test "rising within-window spread raises :wobbling while the mean stays quiet" do
@@ -260,11 +292,12 @@ defmodule MobiusSmarts.AnalysisTest do
 
     test "a collapsed spread (stuck sensor) raises :flatlined with a bounded concern" do
       seeded(26)
-      # Healthy spread throughout, then the last window goes perfectly
-      # flat: below the wobble band's lower limit with std = 0.0. The
+      # Healthy spread throughout, then the last three windows go
+      # perfectly flat: below the wobble band's lower limit with
+      # std = 0.0, persistently enough for the k-of-n gate. The
       # baseline pool carried spread in every window, so the lower
       # limit is armed and the collapse really is anomalous.
-      stds = List.duplicate(1.0, 119) ++ [0.0]
+      stds = List.duplicate(1.0, 117) ++ [0.0, 0.0, 0.0]
       values = Enum.map(stds, fn s -> 50.0 + noise(s / :math.sqrt(30)) end)
 
       lists = %{
@@ -310,6 +343,38 @@ defmodule MobiusSmarts.AnalysisTest do
       candidates = Analysis.tick_candidates(lists, baseline, calib(), config())
 
       refute Enum.find(candidates, &(&1.kind == :flatlined))
+    end
+
+    test "both drift directions in one scan collapse into :baseline_stale (#5)" do
+      # A long stretch below target then a fresh stretch above: both
+      # CUSUM buckets exceed h at scan end. That is not two drifts —
+      # the target no longer describes the series.
+      values = List.duplicate(49.0, 100) ++ List.duplicate(51.0, 5)
+      lists = windows(values, std: 1.0)
+
+      candidates =
+        Analysis.tick_candidates(lists, healthy_baseline(50.0, 0.2), calib(), config())
+
+      assert [stale] = Enum.filter(candidates, &(&1.kind == :baseline_stale))
+      assert stale.class == :observation
+      assert stale.message =~ "both sides"
+      refute Enum.any?(candidates, &(&1.kind in [:drifting_up, :drifting_down]))
+    end
+  end
+
+  describe "departure_candidates/2 (#6)" do
+    test "leaving the constant raises :departed after k-of-n; a single blip stays quiet" do
+      baseline = %{target: 100.0, degenerate: true}
+
+      blip = windows(List.duplicate(100.0, 39) ++ [113.0], std: 0.0)
+      assert Analysis.departure_candidates(blip, baseline) == []
+
+      stepped = windows(List.duplicate(100.0, 37) ++ List.duplicate(113.0, 3), std: 0.0)
+      assert [departed] = Analysis.departure_candidates(stepped, baseline)
+      assert departed.kind == :departed
+      assert departed.class == :condition
+      assert departed.onset == Enum.at(stepped.ts, 37)
+      assert departed.message =~ "left its constant"
     end
   end
 

@@ -56,6 +56,15 @@ defmodule MobiusSmarts.Board do
     GenServer.call(board, {:put, {:learning, key}, progress})
   end
 
+  @doc """
+  Forget a metric's baseline — the stale-baseline response (issue #5):
+  the metric returns to learning and refits from current history.
+  """
+  @spec drop_baseline(atom(), scope()) :: :ok
+  def drop_baseline(board, key) do
+    GenServer.call(board, {:drop_baseline, key})
+  end
+
   @spec put_novelty(atom(), map()) :: :ok
   def put_novelty(board, model_map) do
     GenServer.call(board, {:put, :novelty, model_map})
@@ -121,6 +130,7 @@ defmodule MobiusSmarts.Board do
         Finding.id(finding)
       end
 
+    displace_opposites(state, scope, candidates, now)
     miss_uncovered(state, scope, covered_kinds, MapSet.new(confirmed_ids), now)
     refresh_status(state)
     {:reply, :ok, state}
@@ -136,6 +146,12 @@ defmodule MobiusSmarts.Board do
   def handle_call({:put_baseline, key, baseline}, _from, state) do
     :ets.insert(state.table, {{:baseline, key}, baseline})
     :ets.delete(state.table, {:learning, key})
+    refresh_status(state)
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:drop_baseline, key}, _from, state) do
+    :ets.delete(state.table, {:baseline, key})
     refresh_status(state)
     {:reply, :ok, state}
   end
@@ -214,13 +230,69 @@ defmodule MobiusSmarts.Board do
 
   defp miss(state, id, finding, misses, now) do
     if misses >= state.config.clear_after do
-      cleared = %{finding | status: :cleared, cleared_at: now}
-      :ets.insert(state.table, {{:finding, id}, cleared, 0})
-      emit(state, :cleared, cleared)
+      clear(state, id, finding, now)
     else
       :ets.insert(state.table, {{:finding, id}, finding, misses})
     end
   end
+
+  defp clear(state, id, finding, now) do
+    cleared = %{finding | status: :cleared, cleared_at: now}
+    :ets.insert(state.table, {{:finding, id}, cleared, 0})
+    emit(state, :cleared, cleared)
+  end
+
+  # Directional kind pairs displace each other immediately (issue #5):
+  # a level cannot be shifted up and shifted down at once, so raising
+  # one direction clears the other without waiting out clear_after —
+  # unless both arrived in the same pass, which is its own
+  # contradiction and handled upstream as :baseline_stale.
+  @opposites %{
+    shifted_up: :shifted_down,
+    shifted_down: :shifted_up,
+    drifting_up: :drifting_down,
+    drifting_down: :drifting_up
+  }
+
+  defp displace_opposites(state, {metric, tags}, candidates, now) do
+    confirmed =
+      for %{class: :condition, kind: kind} <- candidates, into: MapSet.new(), do: kind
+
+    displaced =
+      for kind <- confirmed,
+          opposite = @opposites[kind],
+          opposite != nil,
+          not MapSet.member?(confirmed, opposite),
+          into: MapSet.new(),
+          do: opposite
+
+    if MapSet.size(displaced) > 0 do
+      :ets.foldl(
+        fn row, acc ->
+          displace_row(state, row, metric, tags, displaced, now)
+          acc
+        end,
+        :ok,
+        state.table
+      )
+    end
+  end
+
+  defp displace_row(
+         state,
+         {{:finding, id}, %Finding{class: :condition, status: :active} = finding, _miss},
+         metric,
+         tags,
+         displaced,
+         now
+       ) do
+    if finding.metric == metric and finding.tags == tags and
+         MapSet.member?(displaced, finding.kind) do
+      clear(state, id, finding, now)
+    end
+  end
+
+  defp displace_row(_state, _row, _metric, _tags, _displaced, _now), do: :ok
 
   ## Aggregate health
 
@@ -286,14 +358,14 @@ defmodule MobiusSmarts.Board do
   defp metric_states(state) do
     for metric <- state.config.watch do
       key = Config.Metric.key(metric)
-      baseline? = :ets.lookup(state.table, {:baseline, key}) != []
+      baseline = lookup(state.table, {:baseline, key})
 
-      if baseline? do
+      if baseline do
         %{
           metric: metric.name,
           tags: metric.tags,
           detection: :active,
-          detectors: armed_detectors(metric, true),
+          detectors: armed_detectors(metric, baseline),
           learning: nil
         }
       else
@@ -305,7 +377,7 @@ defmodule MobiusSmarts.Board do
           metric: metric.name,
           tags: metric.tags,
           detection: detection_state(progress.reason),
-          detectors: armed_detectors(metric, false),
+          detectors: armed_detectors(metric, nil),
           learning: with_eta(progress, state.config)
         }
       end
@@ -324,12 +396,19 @@ defmodule MobiusSmarts.Board do
 
   defp with_eta(progress, _config), do: Map.put(progress, :eta_s, nil)
 
-  defp armed_detectors(metric, baseline?) do
+  defp armed_detectors(metric, baseline) do
     baseline_gated =
-      if baseline? do
-        [:jump, :shift, :drift] ++ if metric.histogram, do: [:shape], else: []
-      else
-        []
+      cond do
+        baseline == nil ->
+          []
+
+        # A constant metric: the chart stack is dark; departure
+        # detection is what's armed (issue #6).
+        baseline[:degenerate] ->
+          [:departure]
+
+        true ->
+          [:jump, :shift, :drift] ++ if metric.histogram, do: [:shape], else: []
       end
 
     trend = if metric.ceiling || metric.floor, do: [:trend], else: []

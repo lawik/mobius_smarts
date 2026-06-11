@@ -68,10 +68,12 @@ defmodule MobiusSmarts.HarnessTest do
     end
   end
 
-  describe "boot ramp (issues #2, #3, #5)" do
-    # The 2026-06-11 on-device incident, reproduced: memory ramps
-    # after boot, the baseline fits mid-creep, and the tick rescans
-    # pre-fit history against the new target.
+  describe "boot ramp (fixed: #2, #3, #5)" do
+    # The 2026-06-11 on-device incident: memory ramps after boot, then
+    # creeps, then settles. Fixed behavior: the trend gate (#3) defers
+    # the fit until the plateau, the fit-horizon rule (#2) never
+    # re-scores pre-fit history, so no phantom drift in either
+    # direction (#5) — the ramp is learned around, not alarmed about.
     defp boot_ramp_result do
       windows =
         Synthetic.series(
@@ -79,50 +81,48 @@ defmodule MobiusSmarts.HarnessTest do
           segments: [
             # Boot ramp: 79MB -> 90MB over 20 minutes...
             %{minutes: 20, from: 79_000.0, to: 90_000.0, sigma: 2_500.0},
-            # ...then a plateau that keeps creeping upward slowly.
-            %{minutes: 160, from: 90_000.0, to: 93_000.0, sigma: 2_500.0}
+            # ...creeping toward its working level...
+            %{minutes: 60, from: 90_000.0, to: 93_000.0, sigma: 2_500.0},
+            # ...then settled there.
+            %{minutes: 120, level: 93_000.0, sigma: 2_500.0}
           ]
         )
 
       Replay.run(windows, config: [false_alarm_every: {1, :week}])
     end
 
-    test "CURRENT BEHAVIOR #2: pre-fit history raises a phantom :drifting_down about the past" do
+    test "the baseline waits out the ramp and lands on the settled level (#3)" do
       result = boot_ramp_result()
 
-      assert %{fitted_at: fitted_at} = result.baseline
+      assert %{target: target, degenerate: degenerate} =
+               Map.put_new(result.baseline || %{}, :degenerate, false)
 
-      assert down = Enum.find(result.raised, &(&1.kind == :drifting_down)),
-             "expected the phantom drifting_down (raised kinds: #{inspect(kinds(result.raised))})"
-
-      # The smoking gun from the device: the "drift" began before the
-      # baseline existed — the detector is re-reading already-adjudicated
-      # ramp data against the later-fitted target.
-      assert down.onset < fitted_at
+      refute degenerate
+      # Fitted on the plateau, not frozen mid-ramp.
+      assert_in_delta target, 93_000.0, 700.0
     end
 
-    test "CURRENT BEHAVIOR #3: the mid-creep target makes real slow growth alarm immediately" do
+    test "no phantom drift in either direction (#2, #5)" do
       result = boot_ramp_result()
 
-      assert Enum.find(result.raised, &(&1.kind == :drifting_up)),
-             "expected drifting_up shortly after the mid-ramp fit " <>
-               "(raised kinds: #{inspect(kinds(result.raised))})"
-    end
+      phantom =
+        Enum.filter(
+          result.raised,
+          &(&1.kind in [:drifting_down, :drifting_up, :shifted_up, :shifted_down])
+        )
 
-    test "CURRENT BEHAVIOR #5: both drift directions report against the same target" do
-      result = boot_ramp_result()
-      raised_kinds = kinds(result.raised)
-
-      assert :drifting_down in raised_kinds and :drifting_up in raised_kinds,
-             "expected the contradiction (raised kinds: #{inspect(raised_kinds)})"
+      assert phantom == [],
+             "expected no drift/shift findings on a healthy boot, " <>
+               "got #{inspect(kinds(phantom))}"
     end
   end
 
-  describe "constant metrics (issue #6)" do
-    test "CURRENT BEHAVIOR #6: zero variance blocks detection and a level step goes unseen" do
-      # A perfectly constant metric (process_count-shaped): the fit
-      # correctly refuses (zero variance), but then the one real event
-      # — a step to a new constant — passes completely undetected.
+  describe "constant metrics (fixed: #6)" do
+    test "a constant metric fits a degenerate baseline and a level step raises :departed" do
+      # A perfectly constant metric (process_count-shaped): the sigma
+      # charts have nothing to price, so a degenerate baseline arms
+      # departure-only detection — and the one real event, the step to
+      # a new constant, is caught.
       windows =
         Synthetic.series(
           seed: 4,
@@ -134,21 +134,25 @@ defmodule MobiusSmarts.HarnessTest do
 
       result = Replay.run(windows, config: [false_alarm_every: {1, :week}])
 
-      assert result.baseline == nil
-      assert [%{detection: :blocked}] = result.status.metrics
+      assert result.baseline.degenerate
+      assert result.baseline.target == 100.0
+      assert [%{detection: :active, detectors: detectors}] = result.status.metrics
+      assert :departure in detectors
 
-      assert conditions(result.raised) == [],
-             "the 100 -> 113 step was expected to pass unseen (current blind spot); " <>
-               "raised: #{inspect(kinds(result.raised))}"
+      assert [departed | _rest] = Enum.filter(result.raised, &(&1.kind == :departed))
+      # Onset is the first window of the new constant (segment two
+      # begins at global window index 90; windows are end-stamped).
+      assert departed.onset == 1_750_000_000 + 90 * 60
+      assert departed.message =~ "left its constant"
     end
   end
 
-  describe "single-window excursions (issue #7)" do
-    test "CURRENT BEHAVIOR #7: one bad window raises a :jumped condition with no persistence" do
-      # Steady data, then exactly one window beyond the X-bar band but
-      # inside CUSUM/EWMA territory: 25 years of shipped systems
-      # require k-of-n confirmation before alarming; we raise on the
-      # single excursion.
+  describe "single-window excursions (fixed: #7)" do
+    test "one bad window stays an observation; a sustained excursion raises :jumped" do
+      # k-of-n persistence: a single window beyond the X-bar band (but
+      # inside CUSUM/EWMA territory) surfaces as a :spiked observation
+      # once history moves past it — never as a condition. Three
+      # out-of-band windows in the trailing five do raise.
       steady =
         Synthetic.series(
           seed: 5,
@@ -157,19 +161,38 @@ defmodule MobiusSmarts.HarnessTest do
 
       last = List.last(steady)
 
-      spike = %{
-        timestamp: last.timestamp + 60,
-        average: last.average + 1.5,
-        std_dev: 1.0,
-        reports: 18
-      }
+      excursion = fn count ->
+        for i <- 1..count do
+          %{timestamp: last.timestamp + i * 60, average: 101.5, std_dev: 1.0, reports: 18}
+        end
+      end
 
-      result = Replay.run(steady ++ [spike], config: [false_alarm_every: {1, :week}])
+      calm = fn count, offset ->
+        for i <- 1..count do
+          %{
+            timestamp: last.timestamp + (offset + i) * 60,
+            average: 100.0,
+            std_dev: 1.0,
+            reports: 18
+          }
+        end
+      end
 
-      assert Enum.find(result.raised, &(&1.kind == :jumped)),
-             "expected the single-window :jumped (raised: #{inspect(kinds(result.raised))})"
+      blip = steady ++ excursion.(1) ++ calm.(5, 1)
+      result = Replay.run(blip, config: [false_alarm_every: {1, :week}])
 
-      refute Enum.find(result.raised, &(&1.kind in [:drifting_up, :shifted_up]))
+      refute Enum.find(result.raised, &(&1.kind == :jumped)),
+             "a single excursion must not raise a condition " <>
+               "(raised: #{inspect(kinds(result.raised))})"
+
+      assert Enum.find(result.raised, &(&1.kind == :spiked))
+
+      sustained = steady ++ excursion.(4)
+      sustained_result = Replay.run(sustained, config: [false_alarm_every: {1, :week}])
+
+      assert Enum.find(sustained_result.raised, &(&1.kind == :jumped)),
+             "a sustained excursion must still raise " <>
+               "(raised: #{inspect(kinds(sustained_result.raised))})"
     end
   end
 end

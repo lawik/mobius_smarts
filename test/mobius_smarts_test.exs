@@ -92,12 +92,12 @@ defmodule MobiusSmartsTest do
 
     assert :jump in armed.detectors
 
-    # The metric shifts; ticks re-scan and confirm a drift.
-    shifted =
-      Enum.map(1..90, fn _ -> 40.0 + noise(0.5) end) ++
-        Enum.map(1..30, fn _ -> 43.0 + noise(0.5) end)
+    # The metric shifts: thirty NEW windows beyond the fitted horizon —
+    # detectors only score data after baseline.to (issue #2), so the
+    # shifted stretch must actually be fresh history.
+    shifted = healthy ++ Enum.map(1..30, fn _ -> 43.0 + noise(0.5) end)
 
-    StubSource.stage(instance, %{{"mem.pct", %{}} => windows(shifted, now)})
+    StubSource.stage(instance, %{{"mem.pct", %{}} => windows(shifted, now + 30 * 60)})
 
     finding =
       eventually(fn ->

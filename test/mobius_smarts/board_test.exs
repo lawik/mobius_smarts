@@ -27,7 +27,7 @@ defmodule MobiusSmarts.BoardTest do
         [:mobius_smarts, :health, :level_changed]
       ],
       &__MODULE__.forward_telemetry/4,
-      self()
+      {self(), name}
     )
 
     on_exit(fn -> :telemetry.detach(handler_id) end)
@@ -35,8 +35,12 @@ defmodule MobiusSmarts.BoardTest do
     %{board: board, name: name}
   end
 
-  def forward_telemetry(event, measurements, metadata, parent) do
-    send(parent, {:telemetry, event, measurements, metadata})
+  # Handlers are global: only forward this test's instance, or other
+  # suites' boards (e.g. the replay harness) pollute the mailbox.
+  def forward_telemetry(event, measurements, metadata, {parent, name}) do
+    if metadata.instance == name do
+      send(parent, {:telemetry, event, measurements, metadata})
+    end
   end
 
   defp candidate(overrides \\ %{}) do
@@ -207,6 +211,21 @@ defmodule MobiusSmarts.BoardTest do
     assert %{detection: :active, learning: nil} = armed
     assert armed.detectors == [:jump, :shift, :drift, :changepoint]
     assert %{target: 1.0} = Board.baseline(name, {"m", %{}})
+  end
+
+  test "an opposite-direction condition displaces its counterpart immediately (#5)",
+       %{name: name} do
+    Board.report(name, @scope, @kinds, [candidate(%{kind: :drifting_down, message: "down"})])
+    assert [%{kind: :drifting_down}] = Board.findings(name)
+
+    # Raising the opposite direction clears the old one at once — no
+    # clear_after wait; a level cannot drift both ways.
+    Board.report(name, @scope, @kinds, [candidate(%{kind: :drifting_up, message: "up"})])
+
+    assert [%{kind: :drifting_up}] = Board.findings(name)
+
+    assert_receive {:telemetry, [:mobius_smarts, :finding, :cleared], _,
+                    %{finding: %{kind: :drifting_down}}}
   end
 
   test "status includes when it was last refreshed", %{name: name} do

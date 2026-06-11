@@ -34,6 +34,7 @@ defmodule MobiusSmarts.Replay do
     :spiked,
     :wobbling,
     :flatlined,
+    :departed,
     :shifted_up,
     :shifted_down,
     :drifting_up,
@@ -64,7 +65,7 @@ defmodule MobiusSmarts.Replay do
         [:mobius_smarts, :finding, :cleared]
       ],
       &__MODULE__.forward_telemetry/4,
-      self()
+      {self(), name}
     )
 
     timestamps = Enum.map(windows, & &1.timestamp)
@@ -90,9 +91,14 @@ defmodule MobiusSmarts.Replay do
     }
   end
 
+  # Telemetry handlers are global: only forward events from THIS
+  # replay's board, or concurrently running tests pollute each other's
+  # event streams.
   @doc false
-  def forward_telemetry([:mobius_smarts, :finding, event], _measurements, meta, parent) do
-    send(parent, {:replay_event, event, meta.finding})
+  def forward_telemetry([:mobius_smarts, :finding, event], _measurements, meta, {parent, board}) do
+    if meta.instance == board do
+      send(parent, {:replay_event, event, meta.finding})
+    end
   end
 
   defp tick(name, key, windows, now, config, calib) do
@@ -125,14 +131,29 @@ defmodule MobiusSmarts.Replay do
               detector_candidates(name, key, segment, now, config, calib)
             end
 
+        if Enum.any?(candidates, &(&1.kind == :baseline_stale)) do
+          Board.drop_baseline(name, key)
+        end
+
         Board.report(name, key, @tick_kinds, candidates)
     end
   end
 
   defp detector_candidates(name, key, segment, now, config, calib) do
     case Board.baseline(name, key) || fit_baseline(name, key, segment, now, config) do
-      nil -> []
-      baseline -> Analysis.tick_candidates(segment, baseline, calib, config)
+      nil ->
+        []
+
+      baseline ->
+        # Mirrors the Watcher: only windows after the fit horizon (#2),
+        # departure detection for degenerate constants (#6).
+        fresh = Analysis.since(segment, baseline.to)
+
+        if baseline[:degenerate] do
+          Analysis.departure_candidates(fresh, baseline)
+        else
+          Analysis.tick_candidates(fresh, baseline, calib, config)
+        end
     end
   end
 

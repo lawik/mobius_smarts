@@ -42,6 +42,8 @@ defmodule MobiusSmarts.Report do
 
   defp state_cell(%{learning: %{reason: :no_data}}), do: "no data yet"
 
+  defp state_cell(%{learning: %{reason: :trending}}), do: "learning: still ramping"
+
   defp state_cell(%{learning: %{reason: :no_dispersion}}),
     do: "blocked: no within-window dispersion"
 
