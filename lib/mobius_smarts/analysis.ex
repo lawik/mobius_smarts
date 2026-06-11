@@ -13,7 +13,9 @@ defmodule MobiusSmarts.Analysis do
   alias MobiusSmarts.Detect.{Changepoint, Drift, Jump, Novelty, Shape, Shift, Trend}
 
   # A condition this far past its alarm threshold escalates to critical.
-  @critical_concern 1.5
+  # Wide on purpose: at 1.5x every steady incident read as a wall of
+  # criticals (issue #9) — :critical should mean "well past any doubt".
+  @critical_concern 3.0
 
   @type lists() :: %{ts: [integer()], avg: [float()], std: [float()], reports: [integer()]}
   @type candidate() :: map()
@@ -308,7 +310,7 @@ defmodule MobiusSmarts.Analysis do
             kind: :jumped,
             detector: :jump,
             class: :condition,
-            severity: :critical,
+            severity: severity_from(concern),
             concern: concern,
             onset: Enum.at(lists.ts, first_i),
             evidence: %{value: value, ucl: ucl, lcl: lcl, target: baseline.target},
@@ -796,8 +798,15 @@ defmodule MobiusSmarts.Analysis do
 
   ## Shared helpers
 
-  defp severity_from(concern) when concern >= @critical_concern, do: :critical
-  defp severity_from(_concern), do: :warning
+  @doc """
+  Severity from a cross-detector concern ratio: `:warning` from the
+  alarm threshold (1x), `:critical` from #{@critical_concern}x — wide
+  bands so a steady incident does not saturate into a wall of
+  criticals (issue #9).
+  """
+  @spec severity_from(number()) :: :warning | :critical
+  def severity_from(concern) when concern >= @critical_concern, do: :critical
+  def severity_from(_concern), do: :warning
 
   defp run_start(flags, last) do
     last..0//-1

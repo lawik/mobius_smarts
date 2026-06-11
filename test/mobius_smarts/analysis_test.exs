@@ -362,6 +362,32 @@ defmodule MobiusSmarts.AnalysisTest do
     end
   end
 
+  describe "severity_from/1 (#9)" do
+    test "wide bands: warning to 3x the threshold, critical beyond" do
+      # A finding at its threshold is worth watching, not paging. The
+      # old 1.5x critical edge turned every steady incident into a
+      # wall of criticals (21 on-device on 2026-06-10).
+      assert Analysis.severity_from(1.0) == :warning
+      assert Analysis.severity_from(2.9) == :warning
+      assert Analysis.severity_from(3.0) == :critical
+      assert Analysis.severity_from(57.9) == :critical
+    end
+
+    test "a confirmed band excursion is banded too, not hardcoded critical" do
+      seeded(28)
+      # Sustained but mild: just past the X-bar band. half-band is
+      # 3.5 * 1.095 / sqrt(30) ~ 0.7, so 51.0 is ~1.43x — warning.
+      values = List.duplicate(50.0, 100) ++ List.duplicate(51.0, 4)
+      lists = windows(values, std: 1.0)
+
+      candidates =
+        Analysis.tick_candidates(lists, healthy_baseline(50.0, 0.2), calib(), config())
+
+      assert jumped = Enum.find(candidates, &(&1.kind == :jumped))
+      assert jumped.severity == :warning
+    end
+  end
+
   describe "departure_candidates/2 (#6)" do
     test "leaving the constant raises :departed after k-of-n; a single blip stays quiet" do
       baseline = %{target: 100.0, degenerate: true}
