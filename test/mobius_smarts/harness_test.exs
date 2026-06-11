@@ -147,6 +147,56 @@ defmodule MobiusSmarts.HarnessTest do
     end
   end
 
+  describe "baseline starvation on choppy metrics (#13)" do
+    test "CURRENT BEHAVIOR #13: character changes faster than min_baseline_windows never fit" do
+      # A binary-memory-shaped metric: the level steps every 20 minutes
+      # as sessions come and go. The honest gates refuse every stretch
+      # (changepoint :unsettled before 60 settled windows accrue), so
+      # six hours pass with the chart stack never armed and only a
+      # perpetually resetting countdown to show for it.
+      windows =
+        Synthetic.series(
+          seed: 6,
+          segments:
+            for i <- 0..17 do
+              %{minutes: 20, level: 100.0 + rem(i, 2) * 20.0, sigma: 1.0}
+            end
+        )
+
+      result = Replay.run(windows, config: [false_alarm_every: {1, :week}])
+
+      assert result.baseline == nil
+      assert [%{detection: :learning, learning: %{reason: reason}}] = result.status.metrics
+      assert reason in [:unsettled, :trending]
+    end
+  end
+
+  describe "durable constant steps (#15)" do
+    test "CURRENT BEHAVIOR #15: a permanent new constant keeps :departed active forever" do
+      # The step is real and worth one alarm — but four hours later the
+      # metric has been perfectly stable at its new value and the
+      # finding is still being re-confirmed against the old constant.
+      # Nothing ever accepts the new normal.
+      windows =
+        Synthetic.series(
+          seed: 7,
+          segments: [
+            %{minutes: 90, level: 100.0, distribution: :constant},
+            %{minutes: 240, level: 113.0, distribution: :constant}
+          ]
+        )
+
+      result = Replay.run(windows, config: [false_alarm_every: {1, :week}])
+
+      # Raised exactly once (re-confirmations update in place)...
+      assert [_one] = Enum.filter(result.raised, &(&1.kind == :departed))
+      # ...but still active after 4h of stability at the new constant,
+      # against a baseline that still says 100.
+      assert [%{kind: :departed, status: :active}] = result.findings
+      assert result.baseline.target == 100.0
+    end
+  end
+
   describe "single-window excursions (fixed: #7)" do
     test "one bad window stays an observation; a sustained excursion raises :jumped" do
       # k-of-n persistence: a single window beyond the X-bar band (but

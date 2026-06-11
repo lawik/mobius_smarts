@@ -131,6 +131,23 @@ defmodule MobiusSmarts.AnalysisTest do
       assert baseline.target == 42.0
     end
 
+    test "CURRENT BEHAVIOR #14: changepoint slicing launders a steep ramp into a fit" do
+      seeded(16)
+      # Steep enough that the changepoint check dices the ramp into
+      # steps; the settled tail then falls under Mann-Kendall
+      # significance and the fit freezes a target partway up a series
+      # that is still rising. Bounded by the fit-horizon rule (#2) —
+      # the continuing rise is detected from fresh data — but the
+      # target is mid-ramp at birth.
+      values = Enum.map(0..179, fn w -> 50.0 + 0.003 * w + noise(0.25) end)
+      lists = windows(values)
+
+      # The full stretch is unambiguously trending...
+      assert MobiusSmarts.Detect.Trend.mann_kendall(values, alpha: 0.01).trend == :increasing
+      # ...yet the fit goes through: the gate only saw the diced tail.
+      assert {:ok, _baseline} = Analysis.fit_baseline(lists, min_windows: 60, now: 0)
+    end
+
     test "a smooth ramp is refused with :trending — never a mid-ramp target (#3)" do
       seeded(18)
       # Gentle enough that the changepoint check cannot slice it into
