@@ -114,16 +114,19 @@ defmodule MobiusSmarts.Analysis do
     if length(lists.avg) < min_windows do
       {:error, progress(:insufficient, length(lists.avg), min_windows)}
     else
-      segment = settled_segment(lists)
-      settled = length(segment.avg)
+      fit_settled(settled_segment(lists), min_windows, now)
+    end
+  end
 
-      if settled < min_windows do
-        {:error, progress(:unsettled, settled, min_windows)}
-      else
-        case do_fit(segment, now) do
-          {:ok, baseline} -> {:ok, baseline}
-          {:error, reason} -> {:error, progress(reason, settled, min_windows)}
-        end
+  defp fit_settled(segment, min_windows, now) do
+    settled = length(segment.avg)
+
+    if settled < min_windows do
+      {:error, progress(:unsettled, settled, min_windows)}
+    else
+      case do_fit(segment, now) do
+        {:ok, baseline} -> {:ok, baseline}
+        {:error, reason} -> {:error, progress(reason, settled, min_windows)}
       end
     end
   end
