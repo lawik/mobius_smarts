@@ -47,6 +47,13 @@ changes detector sensitivity by that factor — which is why the
 recommended wiring is to hand every detector the map and let it pick.
 Explicit `:target`/`:sigma` options remain for overrides.
 
+Cyclic metrics are handled by stating the cycle (`seasonality: {1, :day}`)
+— the runtime learns the shape incrementally in memory and detects on
+residuals once warm, so cycle peaks stop alarming and in-envelope anomalies
+stop hiding (measured on the synthetic harness: a healthy 30-hour cyclic
+series raises 7 false conditions raw and 0 after seasonal warm-up, while a
+dip hidden inside the cycle's swing is caught only on residuals).
+
 Detectors take tensors or plain lists; batch scans are vectorized in Nx and
 the streaming forms (`Drift.step/2`, `Shift.step/2`) carry O(1) state per
 metric. The detectors are deliberately pure and schedule-free; scheduling

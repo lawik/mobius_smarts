@@ -19,7 +19,7 @@ defmodule MobiusSmarts.Board do
 
   use GenServer
 
-  alias MobiusSmarts.{Config, Finding}
+  alias MobiusSmarts.{Config, Finding, Seasonal}
 
   @type scope() :: {String.t(), map()}
 
@@ -69,6 +69,15 @@ defmodule MobiusSmarts.Board do
   def put_novelty(board, model_map) do
     GenServer.call(board, {:put, :novelty, model_map})
   end
+
+  @doc "Store a metric's incremental seasonal model (issue #8)."
+  @spec put_seasonal(atom(), scope(), Seasonal.t()) :: :ok
+  def put_seasonal(board, key, model) do
+    GenServer.call(board, {:put, {:seasonal, key}, model})
+  end
+
+  @spec seasonal(atom(), scope()) :: Seasonal.t() | nil
+  def seasonal(board, key), do: lookup(board, {:seasonal, key})
 
   @spec baseline(atom(), scope()) :: map() | nil
   def baseline(board, key), do: lookup(board, {:baseline, key})
@@ -368,12 +377,15 @@ defmodule MobiusSmarts.Board do
       key = Config.Metric.key(metric)
       baseline = lookup(state.table, {:baseline, key})
 
+      seasonal = seasonal_state(state, key)
+
       if baseline do
         %{
           metric: metric.name,
           tags: metric.tags,
           detection: :active,
           detectors: armed_detectors(metric, baseline),
+          seasonal: seasonal,
           learning: nil
         }
       else
@@ -388,10 +400,35 @@ defmodule MobiusSmarts.Board do
           tags: metric.tags,
           detection: detection,
           detectors: armed_detectors(metric, nil),
+          seasonal: seasonal,
           learning: learning_entry(detection, progress, state.config)
         }
       end
     end
+  end
+
+  # The cross-cutting seasonal posture: :off (not configured),
+  # {:warming, ready_slots, slot_count} while the model learns the
+  # cycle, :active once detection runs on residuals.
+  defp seasonal_state(%{config: %{seasonality: nil}}, _key), do: :off
+
+  defp seasonal_state(state, key) do
+    case lookup(state.table, {:seasonal, key}) do
+      nil ->
+        {:warming, 0, expected_slots(state.config)}
+
+      model ->
+        if Seasonal.ready?(model) do
+          :active
+        else
+          {ready, total} = Seasonal.progress(model)
+          {:warming, ready, total}
+        end
+    end
+  end
+
+  defp expected_slots(config) do
+    div(Config.seconds(config.seasonality), Config.seconds(config.resolution))
   end
 
   # An :unstable metric gets no ETA — that clock keeps resetting, so

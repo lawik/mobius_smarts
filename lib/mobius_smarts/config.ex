@@ -32,6 +32,16 @@ defmodule MobiusSmarts.Config do
     directional on real telemetry — `MobiusSmarts.Calibrate` states
     precisely what is and is not guaranteed.
 
+  Seasonality is opt-in and explicit — never sniffed from the data:
+
+  - `:seasonality` — the metric cycle to model and subtract before
+    detection, e.g. `{1, :day}` (default: none). Must be an exact
+    multiple of `:resolution`; the cycle is split into one slot per
+    resolution window and each slot's expectation is learned
+    incrementally in memory (`MobiusSmarts.Seasonal` — about three
+    cycles to warm up). Until the model is warm, detection runs on
+    the raw series, so nothing useful waits days for data.
+
   And one more becomes required when you opt into ETA projections:
 
   - `:trend_resolution` — window width for the Trend sweep's slope
@@ -136,6 +146,7 @@ defmodule MobiusSmarts.Config do
           mobius_instance: atom(),
           source: module(),
           resolution: duration(),
+          seasonality: duration() | nil,
           trend_resolution: duration() | nil,
           interval: duration(),
           sweep_interval: duration(),
@@ -157,6 +168,7 @@ defmodule MobiusSmarts.Config do
   defstruct mobius_instance: :mobius,
             source: MobiusSmarts.Source,
             resolution: nil,
+            seasonality: nil,
             trend_resolution: nil,
             interval: nil,
             sweep_interval: {1, :hour},
@@ -310,6 +322,7 @@ defmodule MobiusSmarts.Config do
   defp validate!(%__MODULE__{} = c) do
     Enum.each(@duration_keys, &validate_duration!(&1, Map.fetch!(c, &1)))
     validate_trend_resolution!(c)
+    validate_seasonality!(c)
     validate_budget!(c)
     validate_learnable!(c)
 
@@ -389,6 +402,22 @@ defmodule MobiusSmarts.Config do
       raise ArgumentError,
             "invalid MobiusSmarts config: :trend_resolution (#{inspect(c.trend_resolution)}) " <>
               "must fit inside :trend_window (#{inspect(c.trend_window)})"
+    end
+
+    :ok
+  end
+
+  defp validate_seasonality!(%__MODULE__{seasonality: nil}), do: :ok
+
+  defp validate_seasonality!(%__MODULE__{} = c) do
+    validate_duration!(:seasonality, c.seasonality)
+    slots = div(ms(c.seasonality), ms(c.resolution))
+
+    if rem(ms(c.seasonality), ms(c.resolution)) != 0 or slots < 2 do
+      raise ArgumentError,
+            "invalid MobiusSmarts config: :seasonality (#{inspect(c.seasonality)}) must be " <>
+              "an exact multiple of :resolution (#{inspect(c.resolution)}) spanning at " <>
+              "least 2 windows — the cycle is modeled as one slot per resolution window"
     end
 
     :ok

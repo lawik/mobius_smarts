@@ -93,6 +93,21 @@ i.i.d. data realizes 0 false alarms; AR(1) wander (phi 0.995)
 realizes 10 — down from 18 — with the remaining divergence being the
 autocorrelation the seasonal/residual work (#8) targets.
 
+### Seasonality — `MobiusSmarts.Seasonal` (issue #8)
+
+Opt-in, explicit (`seasonality: {1, :day}` — never sniffed): the cycle
+is split into one slot per `:resolution` window, each slot's
+expectation learned incrementally in memory (~three cycles to warm,
+slots fade so a changed season relearns), and once warm the tick
+detectors and baseline fits run on residuals. Raw detection runs until
+then, so nothing waits days for data; the per-metric warm-up shows in
+`status/1` and the report. Baselines record which series they were
+fitted on and are dropped for relearning when the model warms.
+Measured on the harness: a healthy 30-hour cyclic series raises 7
+false conditions raw, 0 after warm-up; an in-envelope dip invisible to
+the raw bands is caught on residuals. v1 covers the tick stack and
+baseline fitting; trend/shape/novelty still see the raw series.
+
 ### Source — `MobiusSmarts.Source`
 
 Mobius data as Nx tensors: per-window summary series (average/std_dev/

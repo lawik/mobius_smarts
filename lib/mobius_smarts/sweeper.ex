@@ -9,7 +9,7 @@ defmodule MobiusSmarts.Sweeper do
 
   use GenServer
 
-  alias MobiusSmarts.{Analysis, Board, Calibrate, Config}
+  alias MobiusSmarts.{Analysis, Board, Calibrate, Config, Seasonal}
 
   require Logger
 
@@ -144,14 +144,30 @@ defmodule MobiusSmarts.Sweeper do
   defp refit(state, metric, key, now) do
     with lists when lists != :empty <-
            pull(state, metric, state.config.analysis_window, state.config.resolution),
+         {series, seasonal?} = seasonal_series(state, key, lists),
          {:ok, fresh} <-
-           Analysis.fit_baseline(lists,
+           Analysis.fit_baseline(series,
              min_windows: state.config.min_baseline_windows,
              now: now
            ) do
-      Board.put_baseline(state.board, key, fresh)
+      Board.put_baseline(state.board, key, Map.put(fresh, :seasonal, seasonal?))
     else
       _keep_old -> :ok
+    end
+  end
+
+  # Refits must fit the same series detection runs on: residuals when
+  # the seasonal model is warm, raw otherwise (issue #8). The Watcher
+  # owns model updates; the sweep only reads.
+  defp seasonal_series(%{config: %{seasonality: nil}}, _key, lists), do: {lists, false}
+
+  defp seasonal_series(state, key, lists) do
+    model = Board.seasonal(state.board, key)
+
+    if model && Seasonal.ready?(model) do
+      {Seasonal.residuals(model, lists), true}
+    else
+      {lists, false}
     end
   end
 

@@ -150,6 +150,11 @@ defmodule MobiusSmarts.Analysis do
     end
   end
 
+  # Stricter than detection's default 0.05: a false :trending only
+  # delays learning by a tick, but persistently gating a stationary
+  # metric on a spurious trend call would hold up detection entirely.
+  @trend_gate_alpha 0.01
+
   # When the changepoint slice removed part of a stretch that trends
   # as a whole, the surviving tail inherits suspicion: a steep ramp
   # diced into steps leaves a weakly-trending tail that passes the
@@ -161,11 +166,6 @@ defmodule MobiusSmarts.Analysis do
     length(segment.avg) < length(lists.avg) and
       Trend.mann_kendall(lists.avg, alpha: @trend_gate_alpha).trend != :none
   end
-
-  # Stricter than detection's default 0.05: a false :trending only
-  # delays learning by a tick, but persistently gating a stationary
-  # metric on a spurious trend call would hold up detection entirely.
-  @trend_gate_alpha 0.01
 
   # A halves difference this many standard errors apart means the
   # "settled" segment still carries a level move. ~0.3% false trips on

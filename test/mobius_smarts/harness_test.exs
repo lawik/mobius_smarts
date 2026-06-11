@@ -206,6 +206,85 @@ defmodule MobiusSmarts.HarnessTest do
     end
   end
 
+  describe "seasonality (#8)" do
+    # A 6-hour cycle against a 2-hour analysis window: each window sees
+    # only a third of the cycle, so the raw series reads as endless
+    # ramps. Shared dataset; the two runs differ only in config.
+    defp cyclic_windows do
+      Synthetic.series(
+        seed: 9,
+        daily_cycle: %{amplitude: 12.0, period: 6 * 3600},
+        segments: [%{minutes: 30 * 60, level: 100.0, sigma: 6.0}]
+      )
+    end
+
+    defp last_12h_conditions(result) do
+      cutoff = 1_750_000_000 + 18 * 3600
+
+      result.raised
+      |> conditions()
+      |> Enum.filter(&(&1.onset != nil and &1.onset >= cutoff))
+    end
+
+    test "the same cycle alarms raw and stays quiet on residuals" do
+      windows = cyclic_windows()
+
+      raw = Replay.run(windows, config: [false_alarm_every: {1, :week}], tick_every: {2, :minute})
+
+      seasonal =
+        Replay.run(windows,
+          config: [false_alarm_every: {1, :week}, seasonality: {6, :hour}],
+          tick_every: {2, :minute}
+        )
+
+      # Without the model, the cycle itself keeps alarming long after
+      # any honest warm-up would be over...
+      assert last_12h_conditions(raw) != [],
+             "expected the raw cycle to alarm (raised: #{inspect(kinds(raw.raised))})"
+
+      # ...with it, the model warms (~3 cycles = 18h) and the same
+      # stretch is quiet, detection running on residuals.
+      assert last_12h_conditions(seasonal) == [],
+             "expected residual detection to stay quiet, " <>
+               "got #{inspect(kinds(last_12h_conditions(seasonal)))}"
+
+      assert [%{seasonal: :active, detection: :active}] = seasonal.status.metrics
+      assert seasonal.baseline[:seasonal] == true
+    end
+
+    test "an in-envelope anomaly invisible to raw bands is caught on residuals" do
+      # A 30-minute dip of ~4 sigma-of-the-mean, placed inside the
+      # cycle's swing after the warm-up: well within the raw series'
+      # cycle-inflated bands, unmistakable in residuals.
+      dip_from = 1_750_000_000 + 26 * 3600
+      dip_until = dip_from + 30 * 60
+
+      windows =
+        Enum.map(cyclic_windows(), fn w ->
+          if w.timestamp >= dip_from and w.timestamp < dip_until do
+            %{w | average: w.average - 6.0}
+          else
+            w
+          end
+        end)
+
+      result =
+        Replay.run(windows,
+          config: [false_alarm_every: {1, :week}, seasonality: {6, :hour}],
+          tick_every: {2, :minute}
+        )
+
+      caught =
+        result.raised
+        |> conditions()
+        |> Enum.filter(&(&1.onset != nil and &1.onset >= dip_from and &1.onset < dip_until + 600))
+
+      assert caught != [],
+             "expected the in-envelope dip to be caught on residuals " <>
+               "(raised: #{inspect(kinds(result.raised))})"
+    end
+  end
+
   describe "single-window excursions (fixed: #7)" do
     test "one bad window stays an observation; a sustained excursion raises :jumped" do
       # k-of-n persistence: a single window beyond the X-bar band (but

@@ -102,6 +102,21 @@ defmodule MobiusSmarts.ConfigTest do
     end
   end
 
+  describe "seasonality" do
+    test "accepts an exact multiple of resolution, rejects misalignment" do
+      config = new!(seasonality: {2, :hour})
+      assert config.seasonality == {2, :hour}
+
+      assert_raise ArgumentError, ~r/exact multiple of :resolution/, fn ->
+        new!(seasonality: {90, :second})
+      end
+
+      assert_raise ArgumentError, ~r/at least 2 windows/, fn ->
+        new!(seasonality: {1, :minute})
+      end
+    end
+  end
+
   describe "new!/1 requires" do
     # A missing :resolution is covered by the doctest.
 

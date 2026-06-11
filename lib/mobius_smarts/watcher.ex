@@ -9,7 +9,7 @@ defmodule MobiusSmarts.Watcher do
 
   use GenServer
 
-  alias MobiusSmarts.{Analysis, Board, Calibrate, Config}
+  alias MobiusSmarts.{Analysis, Board, Calibrate, Config, Seasonal}
 
   require Logger
 
@@ -124,12 +124,14 @@ defmodule MobiusSmarts.Watcher do
         stale_after = config.gap_factor * resolution_s
         stale? = now - last_ts > stale_after
 
+        {detection_segment, seasonal?} = seasonal_series(state, key, lists, segment)
+
         candidates =
           Analysis.gap_candidates(gaps) ++
             if stale? do
               [Analysis.silent_candidate(last_ts, now)]
             else
-              detector_candidates(state, key, segment, now)
+              detector_candidates(state, key, detection_segment, seasonal?, now)
             end
 
         # A stale-baseline observation is also an instruction: drop the
@@ -177,8 +179,33 @@ defmodule MobiusSmarts.Watcher do
     end
   end
 
-  defp detector_candidates(state, key, segment, now) do
-    case Board.baseline(state.board, key) || fit_baseline(state, key, segment, now) do
+  # Update the metric's seasonal model from everything in view (the
+  # high-water mark makes re-presented windows a no-op) and, once it
+  # is warm, hand back residuals for detection instead of the raw
+  # segment (issue #8). Raw until then: nothing waits days for data.
+  defp seasonal_series(%{config: %{seasonality: nil}}, _key, _lists, segment) do
+    {segment, false}
+  end
+
+  defp seasonal_series(state, key, lists, segment) do
+    config = state.config
+
+    model =
+      (Board.seasonal(state.board, key) || Seasonal.new(config.seasonality, config.resolution))
+      |> Seasonal.update(lists)
+
+    Board.put_seasonal(state.board, key, model)
+
+    if Seasonal.ready?(model) do
+      {Seasonal.residuals(model, segment), true}
+    else
+      {segment, false}
+    end
+  end
+
+  defp detector_candidates(state, key, segment, seasonal?, now) do
+    case current_baseline(state, key, seasonal?) ||
+           fit_baseline(state, key, segment, seasonal?, now) do
       nil ->
         []
 
@@ -195,12 +222,28 @@ defmodule MobiusSmarts.Watcher do
     end
   end
 
-  defp fit_baseline(state, key, segment, now) do
+  # A baseline fitted on a different series than detection now runs on
+  # — raw vs residual — is meaningless: when the seasonal model warms
+  # (one-way, visits only grow), drop the raw-fitted baseline and
+  # relearn on residuals.
+  defp current_baseline(state, key, seasonal?) do
+    baseline = Board.baseline(state.board, key)
+
+    if baseline && (baseline[:seasonal] || false) != seasonal? do
+      Board.drop_baseline(state.board, key)
+      nil
+    else
+      baseline
+    end
+  end
+
+  defp fit_baseline(state, key, segment, seasonal?, now) do
     case Analysis.fit_baseline(segment,
            min_windows: state.config.min_baseline_windows,
            now: now
          ) do
       {:ok, baseline} ->
+        baseline = Map.put(baseline, :seasonal, seasonal?)
         Board.put_baseline(state.board, key, baseline)
         baseline
 

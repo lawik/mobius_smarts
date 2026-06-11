@@ -31,6 +31,7 @@ defmodule MobiusSmarts.ReportTest do
         tags: %{},
         detection: :active,
         detectors: [:jump, :shift, :drift, :shape, :changepoint],
+        seasonal: :off,
         learning: nil
       },
       Map.new(overrides)
@@ -44,7 +45,7 @@ defmodule MobiusSmarts.ReportTest do
       concern: 96.44,
       novelty: :active,
       metrics: [
-        metric_entry([]),
+        metric_entry(seasonal: {:warming, 120, 360}),
         metric_entry(
           metric: "vm.memory.binary",
           detection: :learning,
@@ -79,6 +80,7 @@ defmodule MobiusSmarts.ReportTest do
     assert report =~ ~r/vm\.memory\.binary\s+learning 37\/60 \(~23m\)\s+changepoint/
     assert report =~ ~r/io\s+blocked: no within-window dispersion\s+changepoint/
     # Worst first, the novelty stream labeled as cross-metric.
+    assert report =~ "[seasonal warming 120/360]"
     assert report =~ ~r/crit\s+96\.4×\s+novel_behavior\s+\(cross-metric\)/
     assert report =~ "way off habits"
     assert report =~ ~r/warn\s+1\.0×\s+flatlined/
@@ -102,6 +104,8 @@ defmodule MobiusSmarts.ReportTest do
     assert report =~ "MobiusSmarts — OK — concern 0.0"
     assert report =~ "novelty learning"
     assert report =~ "no active findings"
+    # seasonal: :off renders nothing.
+    refute report =~ "[seasonal"
     refute report =~ "recent observations:"
   end
 end

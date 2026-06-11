@@ -24,7 +24,7 @@ defmodule MobiusSmarts.Replay do
       result.baseline    # fitted baseline (or nil)
   """
 
-  alias MobiusSmarts.{Analysis, Board, Calibrate, Config, Source}
+  alias MobiusSmarts.{Analysis, Board, Calibrate, Config, Seasonal, Source}
 
   @metric "synthetic"
 
@@ -124,12 +124,14 @@ defmodule MobiusSmarts.Replay do
         last_ts = List.last(segment.ts)
         stale? = now - last_ts > config.gap_factor * resolution_s
 
+        {detection_segment, seasonal?} = seasonal_series(name, key, lists, segment, config)
+
         candidates =
           Analysis.gap_candidates(gaps) ++
             if stale? do
               [Analysis.silent_candidate(last_ts, now)]
             else
-              detector_candidates(name, key, segment, now, config, calib)
+              detector_candidates(name, key, detection_segment, seasonal?, now, config, calib)
             end
 
         if Enum.any?(candidates, &(&1.kind == :baseline_stale)) do
@@ -140,8 +142,26 @@ defmodule MobiusSmarts.Replay do
     end
   end
 
-  defp detector_candidates(name, key, segment, now, config, calib) do
-    case Board.baseline(name, key) || fit_baseline(name, key, segment, now, config) do
+  # Mirrors the Watcher's seasonal orchestration (issue #8).
+  defp seasonal_series(_name, _key, _lists, segment, %{seasonality: nil}), do: {segment, false}
+
+  defp seasonal_series(name, key, lists, segment, config) do
+    model =
+      (Board.seasonal(name, key) || Seasonal.new(config.seasonality, config.resolution))
+      |> Seasonal.update(lists)
+
+    Board.put_seasonal(name, key, model)
+
+    if Seasonal.ready?(model) do
+      {Seasonal.residuals(model, segment), true}
+    else
+      {segment, false}
+    end
+  end
+
+  defp detector_candidates(name, key, segment, seasonal?, now, config, calib) do
+    case current_baseline(name, key, seasonal?) ||
+           fit_baseline(name, key, segment, seasonal?, now, config) do
       nil ->
         []
 
@@ -158,9 +178,21 @@ defmodule MobiusSmarts.Replay do
     end
   end
 
-  defp fit_baseline(name, key, segment, now, config) do
+  defp current_baseline(name, key, seasonal?) do
+    baseline = Board.baseline(name, key)
+
+    if baseline && (baseline[:seasonal] || false) != seasonal? do
+      Board.drop_baseline(name, key)
+      nil
+    else
+      baseline
+    end
+  end
+
+  defp fit_baseline(name, key, segment, seasonal?, now, config) do
     case Analysis.fit_baseline(segment, min_windows: config.min_baseline_windows, now: now) do
       {:ok, baseline} ->
+        baseline = Map.put(baseline, :seasonal, seasonal?)
         Board.put_baseline(name, key, baseline)
         baseline
 

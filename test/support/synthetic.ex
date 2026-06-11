@@ -30,8 +30,8 @@ defmodule MobiusSmarts.Synthetic do
     *ends* at (windows are end-stamped, like Mobius's)
   - `:resolution` (default `{1, :minute}`) — window cadence
   - `:reports` (default `18`) — reports per window
-  - `:daily_cycle` — `%{amplitude: a}` adds `a·sin(2πt/day)` to every
-    level
+  - `:daily_cycle` — `%{amplitude: a}` adds `a·sin(2πt/period)` to
+    every level; `:period` (seconds) defaults to a day
   - `:wander` — `%{phi: p, sigma: s}` adds an AR(1) random walk to the
     level across windows: autocorrelated data that violates the
     independence assumption behind the false-alarm budget (issue #12)
@@ -90,8 +90,9 @@ defmodule MobiusSmarts.Synthetic do
 
   defp cycle_at(nil, _ts), do: 0.0
 
-  defp cycle_at(%{amplitude: amplitude}, ts) do
-    amplitude * :math.sin(2.0 * :math.pi() * ts / @day_s)
+  defp cycle_at(%{amplitude: amplitude} = cycle, ts) do
+    period = Map.get(cycle, :period, @day_s)
+    amplitude * :math.sin(2.0 * :math.pi() * ts / period)
   end
 
   defp advance_wander(_state, nil), do: 0.0

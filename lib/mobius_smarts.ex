@@ -66,6 +66,14 @@ defmodule MobiusSmarts do
   ones do (ETA-to-ceiling projections, retrospective change points,
   distribution-shape drift), with quiet-period baseline refits.
 
+  Cyclic metrics get the same honesty: state `seasonality: {1, :day}`
+  and the cycle is learned incrementally in memory (about three
+  cycles — `MobiusSmarts.Seasonal`), after which every detector runs
+  on residuals (`value − expected-at-this-point-in-the-cycle`)
+  instead of alarming on the cycle's own peaks or missing anomalies
+  hidden inside its envelope. Raw detection runs until the model is
+  warm, and the warm-up is visible per metric in `status/1`.
+
   Reporting gaps are first-class: a metric going quiet raises a
   `:silent` condition, a past gap is recorded as a `:reporting_gap`
   observation, and detectors re-anchor after long gaps rather than

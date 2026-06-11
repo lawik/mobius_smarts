@@ -32,10 +32,18 @@ defmodule MobiusSmarts.Report do
       for {entry, cell} <- cells do
         "  #{String.pad_trailing(entry.metric, name_width)}  " <>
           "#{String.pad_trailing(cell, cell_width)}  " <>
-          Enum.map_join(entry.detectors, " ", &Atom.to_string/1)
+          Enum.map_join(entry.detectors, " ", &Atom.to_string/1) <>
+          seasonal_suffix(entry.seasonal)
       end
 
     ["", "metrics:" | rows]
+  end
+
+  defp seasonal_suffix(:off), do: ""
+  defp seasonal_suffix(:active), do: "  [seasonal]"
+
+  defp seasonal_suffix({:warming, ready, total}) do
+    "  [seasonal warming #{ready}/#{total}]"
   end
 
   defp state_cell(%{detection: :active}), do: "active"
