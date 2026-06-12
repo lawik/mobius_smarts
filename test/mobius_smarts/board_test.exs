@@ -222,14 +222,28 @@ defmodule MobiusSmarts.BoardTest do
     Board.put_learning(name, {"m", %{}}, %{reason: :no_dispersion, windows: 80, needed: 60})
     assert %{metrics: [%{detection: :blocked, learning: %{eta_s: nil}}]} = Board.status(name)
 
-    # Abundant data that still won't settle is :unstable — and an ETA
-    # would be a lie, so it carries none (#13).
+    # A full window alone is settling after a regime change — still
+    # :learning with the countdown intact (#16)...
     Board.put_learning(name, {"m", %{}}, %{
       reason: :unsettled,
       windows: 20,
       needed: 60,
       seen: 120
     })
+
+    assert %{metrics: [%{detection: :learning}]} = Board.status(name)
+
+    # ...but repeated resets of the settled count are chronic: with a
+    # full window AND three stalls, :unstable — and an ETA would be a
+    # lie, so it carries none (#13).
+    for windows <- [3, 15, 2, 9, 1] do
+      Board.put_learning(name, {"m", %{}}, %{
+        reason: :unsettled,
+        windows: windows,
+        needed: 60,
+        seen: 120
+      })
+    end
 
     assert %{metrics: [%{detection: :unstable, learning: %{eta_s: nil}}]} = Board.status(name)
 

@@ -53,7 +53,7 @@ defmodule MobiusSmarts.Board do
   """
   @spec put_learning(atom(), scope(), map()) :: :ok
   def put_learning(board, key, progress) do
-    GenServer.call(board, {:put, {:learning, key}, progress})
+    GenServer.call(board, {:put_learning, key, progress})
   end
 
   @doc """
@@ -147,6 +147,13 @@ defmodule MobiusSmarts.Board do
 
   def handle_call({:put, key, value}, _from, state) do
     :ets.insert(state.table, {key, value})
+    refresh_status(state)
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:put_learning, key, progress}, _from, state) do
+    progress = with_stalls(progress, lookup(state.table, {:learning, key}))
+    :ets.insert(state.table, {{:learning, key}, progress})
     refresh_status(state)
     {:reply, :ok, state}
   end
@@ -436,16 +443,31 @@ defmodule MobiusSmarts.Board do
   defp learning_entry(:unstable, progress, _config), do: Map.put(progress, :eta_s, nil)
   defp learning_entry(_detection, progress, config), do: with_eta(progress, config)
 
+  # Chronic instability is the settled stretch repeatedly RESETTING:
+  # each time the settled count shrinks, a regime change knocked the
+  # clock back (issue #16). A growing count is a countdown, however
+  # full the window is.
+  defp with_stalls(progress, nil), do: Map.put(progress, :stalls, 0)
+
+  defp with_stalls(progress, previous) do
+    stalls = Map.get(previous, :stalls, 0)
+    stalls = if progress.windows < Map.get(previous, :windows, 0), do: stalls + 1, else: stalls
+    Map.put(progress, :stalls, stalls)
+  end
+
   # No amount of waiting fits a baseline on data with nothing to model.
   defp detection_state(%{reason: reason}) when reason in [:no_dispersion, :zero_variance],
     do: :blocked
 
-  # Abundant data that still will not settle: the metric's character
-  # changes faster than min_baseline_windows of stability allows
-  # (issue #13) — chronically unmonitorable by the chart stack, and
-  # named as such instead of showing a forever-resetting countdown.
-  defp detection_state(%{reason: reason, seen: seen, needed: needed})
-       when reason in [:unsettled, :trending] and seen >= 2 * needed,
+  # Abundant data AND repeated resets of the settled stretch: the
+  # metric's character changes faster than min_baseline_windows of
+  # stability allows (issues #13, #16) — chronically unmonitorable by
+  # the chart stack, and named as such instead of showing a
+  # forever-resetting countdown. Either signal alone is not chronic: a
+  # fresh regime change fills the window while the settled count grows
+  # every tick, and that is a countdown.
+  defp detection_state(%{reason: reason, seen: seen, needed: needed, stalls: stalls})
+       when reason in [:unsettled, :trending] and seen >= 2 * needed and stalls >= 3,
        do: :unstable
 
   defp detection_state(_progress), do: :learning

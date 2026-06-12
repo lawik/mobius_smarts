@@ -177,6 +177,35 @@ defmodule MobiusSmarts.HarnessTest do
     end
   end
 
+  describe "fresh regime changes (#16)" do
+    test "a settling metric with a full window reads :learning with an ETA, not :unstable" do
+      # Two hours of steady history, a step, then half an hour of
+      # settling at the new level: the window is full (seen >= 2x
+      # needed) but the settled count grows every tick — that is a
+      # countdown, not chronic instability.
+      windows =
+        Synthetic.series(
+          seed: 10,
+          segments: [
+            %{minutes: 120, level: 100.0, sigma: 1.0},
+            %{minutes: 30, level: 120.0, sigma: 1.0}
+          ]
+        )
+
+      # Ticks start after the step — a fresh Board against existing
+      # history, exactly the post-reboot shape from the device.
+      result =
+        Replay.run(windows,
+          config: [false_alarm_every: {1, :week}],
+          from: 1_750_000_000 + 120 * 60
+        )
+
+      assert [%{detection: :learning, learning: learning}] = result.status.metrics
+      assert learning.reason == :unsettled
+      assert is_integer(learning.eta_s) and learning.eta_s > 0
+    end
+  end
+
   describe "durable constant steps (fixed: #15)" do
     test "a permanent new constant is alarmed once, then relearned as the new normal" do
       # The step is real and worth one alarm — and once the metric has
